@@ -43,14 +43,42 @@ from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
 from lutris.util.process import Process
 from lutris.util.strings import split_arguments
-from lutris.util.wine import proton
+from lutris.util.wine import dxvk_conf, proton
 from lutris.util.wine.cnc_ddraw import CncDdrawManager
+from lutris.util.wine.cnc_ddraw_conf import (
+    build_runner_options as build_cnc_ddraw_conf_options,
+)
+from lutris.util.wine.cnc_ddraw_conf import (
+    get_managed_values as get_managed_cnc_ddraw_conf_values,
+)
+from lutris.util.wine.cnc_ddraw_conf import (
+    write_cnc_ddraw_conf,
+)
 from lutris.util.wine.d3d_extras import D3DExtrasManager
+from lutris.util.wine.d7vk import D7vkManager
 from lutris.util.wine.dgvoodoo2 import dgvoodoo2Manager
 from lutris.util.wine.dxgl import DxglManager
 from lutris.util.wine.dxvk import REQUIRED_VULKAN_API_VERSION, DXVKManager
+from lutris.util.wine.dxvk_conf import (
+    build_runner_options as build_dxvk_conf_options,
+)
+from lutris.util.wine.dxvk_conf import (
+    get_managed_values as get_managed_dxvk_conf_values,
+)
+from lutris.util.wine.dxvk_conf import (
+    write_dxvk_conf,
+)
 from lutris.util.wine.dxvk_nvapi import DXVKNVAPIManager
 from lutris.util.wine.dxwrapper import DxWrapperManager
+from lutris.util.wine.dxwrapper_conf import (
+    build_runner_options as build_dxwrapper_conf_options,
+)
+from lutris.util.wine.dxwrapper_conf import (
+    get_managed_values as get_managed_dxwrapper_conf_values,
+)
+from lutris.util.wine.dxwrapper_conf import (
+    write_dxwrapper_conf,
+)
 from lutris.util.wine.extract_icon import PEFILE_AVAILABLE, IconExtractor
 from lutris.util.wine.prefix import DEFAULT_DLL_OVERRIDES, WinePrefixManager, find_prefix
 from lutris.util.wine.vkd3d import VKD3DManager
@@ -169,7 +197,7 @@ def _get_dxvk_version_warning(_option_key: str, config: LutrisConfig) -> str | N
     if os.environ.get("LUTRIS_NO_VKQUERY"):
         return None
     runner_config = config.runner_config
-    if is_dxvk_effectively_enabled(runner_config) and LINUX_SYSTEM.is_vulkan_supported():
+    if runner_config.get("dxvk") and LINUX_SYSTEM.is_vulkan_supported():
         version = runner_config.get("dxvk_version")
         if version is not None:
             version = str(version)
@@ -196,68 +224,47 @@ def _get_dxvk_version_warning(_option_key: str, config: LutrisConfig) -> str | N
     return None
 
 
-# Runner option keys for the DirectDraw wrappers that render through OpenGL/GDI
-# and therefore conflict with DXVK-based DDraw (as shipped in CachyOS Wine
-# builds). dgvoodoo2 is deliberately excluded: it translates to Direct3D 11
-# and is designed to be used *with* DXVK.
-DXVK_CONFLICTING_DDRAW_WRAPPERS = ("dxwrapper", "dxgl", "cnc_ddraw")
-
 # Every option providing its own ddraw.dll; at most one of these should be
 # enabled at a time (dgvoodoo2 has no UI option anymore, but existing
-# configurations may still enable it).
-DDRAW_PROVIDER_OPTIONS = ("dgvoodoo2", "dxwrapper", "dxgl", "cnc_ddraw")
+# configurations may still enable it). The wrapper owns ddraw.dll through a
+# native override, while DXVK keeps handling Direct3D 8/9/11 - so chains
+# like DxWrapper's Dd7to9 (DDraw -> D3D9) feeding into DXVK work, including
+# on Wine builds with DXVK-based DDraw such as CachyOS Wine (d7vk).
+DDRAW_PROVIDER_OPTIONS = ("dgvoodoo2", "dxwrapper", "dxgl", "cnc_ddraw", "d7vk")
 
 DDRAW_WRAPPER_LABELS = {
     "dgvoodoo2": "dgvoodoo2",
     "dxwrapper": "DxWrapper",
     "dxgl": "DXGL",
     "cnc_ddraw": "CnC-DDraw",
+    "d7vk": "D7VK",
 }
-
-
-def is_ddraw_wrapper_enabled(runner_config: dict) -> bool:
-    """True if a DirectDraw wrapper that conflicts with DXVK's DDraw is enabled."""
-    return any(bool(runner_config.get(opt)) for opt in DXVK_CONFLICTING_DDRAW_WRAPPERS)
-
-
-def is_dxvk_effectively_enabled(runner_config: dict) -> bool:
-    """Effective DXVK state.
-
-    DXVK must stay off while a conflicting DirectDraw wrapper is enabled;
-    otherwise Wine builds with DXVK-based DDraw support (such as CachyOS Wine)
-    use DXVK's DDraw instead of the wrapper."""
-    if not runner_config.get("dxvk"):
-        return False
-    return not is_ddraw_wrapper_enabled(runner_config)
-
-
-def _get_dxvk_ddraw_conflict_warning(_option_key: str, config: LutrisConfig) -> str | None:
-    if config.runner_config.get("dxvk") and is_ddraw_wrapper_enabled(config.runner_config):
-        return _(
-            "<b>Warning</b> DXVK is enabled together with a DirectDraw wrapper "
-            "(DxWrapper, DXGL or CnC-DDraw). Wine builds with DXVK-based DDraw support "
-            "(such as CachyOS Wine) will use DXVK's DDraw instead of the wrapper. "
-            "Disable DXVK to let the wrapper handle DirectDraw games; "
-            "Lutris disables DXVK automatically while a wrapper is enabled."
-        )
-    return None
 
 
 def _get_ddraw_wrapper_warning(option_key: str, config: LutrisConfig) -> str | None:
     runner_config = config.runner_config
     if not runner_config.get(option_key):
         return None
-    messages = []
-    if runner_config.get("dxvk"):
-        messages.append(_("DXVK is enabled; it is disabled automatically while this wrapper is active."))
     others = [
         DDRAW_WRAPPER_LABELS[opt] for opt in DDRAW_PROVIDER_OPTIONS if opt != option_key and runner_config.get(opt)
     ]
     if others:
-        messages.append(
-            _("Another DirectDraw wrapper (%s) is also enabled; only one wrapper can provide ddraw.dll.")
-            % ", ".join(others)
+        return _("Another DirectDraw wrapper (%s) is also enabled; only one wrapper can provide ddraw.dll.") % (
+            ", ".join(others)
         )
+    return None
+
+
+def _get_d7vk_warning(option_key: str, config: LutrisConfig) -> str | None:
+    runner_config = config.runner_config
+    if not runner_config.get("d7vk"):
+        return None
+    messages = []
+    if not runner_config.get("dxvk"):
+        messages.append(_("D7VK proxies D3D7 and earlier through DXVK's D3D9 backend; enable DXVK as well."))
+    multi = _get_ddraw_wrapper_warning(option_key, config)
+    if multi:
+        messages.append(multi)
     return " ".join(messages) or None
 
 
@@ -431,7 +438,7 @@ class wine(Runner):
             "label": _("Enable DXVK"),
             "type": "bool",
             "default": True,
-            "warning": lambda k, c: _get_dxvk_warning() or _get_dxvk_ddraw_conflict_warning(k, c),
+            "warning": _get_dxvk_warning,
             "error": lambda k, c: _get_simple_vulkan_support_error(k, c, _("DXVK")),
             "active": True,
             "help": _(
@@ -452,6 +459,29 @@ class wine(Runner):
             "choices": lambda: DXVKManager().version_choices,
             "default": lambda: DXVKManager().version,
             "warning": _get_dxvk_version_warning,
+        },
+        {
+            "option": "d7vk",
+            "section": _("Graphics"),
+            "label": _("Enable D7VK"),
+            "type": "bool",
+            "default": False,
+            "warning": _get_d7vk_warning,
+            "help": _(
+                "Use D7VK for Direct3D 7 and earlier 3D games: a minimal D3D7/6/5/3 "
+                "implementation proxying through DXVK's D3D9 backend, using Wine's "
+                "DDraw implementation. Requires DXVK. Only 32-bit applications are supported."
+            ),
+        },
+        {
+            "option": "d7vk_version",
+            "section": _("Graphics"),
+            "label": _("D7VK version"),
+            "advanced": True,
+            "type": "choice_with_entry",
+            "conditional_on": "d7vk",
+            "choices": lambda: D7vkManager().version_choices,
+            "default": lambda: D7vkManager().version,
         },
         {
             "option": "vkd3d",
@@ -530,7 +560,7 @@ class wine(Runner):
             "help": _(
                 "Use DxWrapper to translate DirectDraw, Direct3D 8 and Direct3D 9 calls "
                 "for legacy games. Only 32-bit applications are supported. "
-                "DXVK is disabled automatically while DxWrapper is enabled."
+                "Combines with DXVK, which keeps handling Direct3D 8/9/11 (e.g. Dd7to9 output)."
             ),
         },
         {
@@ -553,7 +583,6 @@ class wine(Runner):
             "help": _(
                 "Use DXGL to translate DirectDraw calls to OpenGL for legacy games. "
                 "Only 32-bit applications are supported. "
-                "DXVK is disabled automatically while DXGL is enabled."
             ),
         },
         {
@@ -576,7 +605,6 @@ class wine(Runner):
             "help": _(
                 "Use CnC-DDraw to translate DirectDraw calls to OpenGL for legacy games. "
                 "Only 32-bit applications are supported. "
-                "DXVK is disabled automatically while CnC-DDraw is enabled."
             ),
         },
         {
@@ -794,6 +822,9 @@ class wine(Runner):
             "default": False,
             "help": _("Automatically disables one of Wine's detected joypad to avoid having 2 controllers detected"),
         },
+        *build_dxvk_conf_options(),
+        *build_cnc_ddraw_conf_options(),
+        *build_dxwrapper_conf_options(),
     ]
 
     reg_prefix = "HKEY_CURRENT_USER/Software/Wine"
@@ -1370,6 +1401,17 @@ class wine(Runner):
             else:
                 logger.warning("Cannot deploy %s: no game directory and no prefix.", manager.human_name)
 
+        # DXVK and D7VK read dxvk.conf from the game directory; write the
+        # managed options there. Needs no prefix either.
+        if game_dir and any(self.runner_config.get(opt) for opt in dxvk_conf.CONF_TOGGLES):
+            write_dxvk_conf(game_dir, get_managed_dxvk_conf_values(self.runner_config))
+        # CnC-DDraw reads ddraw.ini from the game directory; same deal.
+        if game_dir and self.runner_config.get("cnc_ddraw"):
+            write_cnc_ddraw_conf(game_dir, get_managed_cnc_ddraw_conf_values(self.runner_config))
+        # DxWrapper reads dxwrapper.ini from the game directory; same deal.
+        if game_dir and self.runner_config.get("dxwrapper"):
+            write_dxwrapper_conf(game_dir, get_managed_dxwrapper_conf_values(self.runner_config))
+
         client_exe = self.game_config.get("client_exe")
         if client_exe:
             self._ensure_client_running(client_exe)
@@ -1412,6 +1454,7 @@ class wine(Runner):
         only enabled managers are returned, so disabled managers are not created."""
         manager_classes = [
             (DXVKManager, "dxvk", "dxvk_version"),
+            (D7vkManager, "d7vk", "d7vk_version"),
             (VKD3DManager, "vkd3d", "vkd3d_version"),
             (DXVKNVAPIManager, "dxvk_nvapi", "dxvk_nvapi_version"),
             (D3DExtrasManager, "d3d_extras", "d3d_extras_version"),
@@ -1424,17 +1467,13 @@ class wine(Runner):
         managers = {}
         wine_exe = self.get_executable()
         is_proton = proton.is_proton_path(wine_exe) or proton.is_umu_path(wine_exe)
-        ddraw_wrapper_active = is_ddraw_wrapper_enabled(self.runner_config)
 
-        if ddraw_wrapper_active:
-            enabled_wrappers = [
-                DDRAW_WRAPPER_LABELS[opt] for opt in DDRAW_PROVIDER_OPTIONS if self.runner_config.get(opt)
-            ]
-            if len(enabled_wrappers) > 1:
-                logger.warning(
-                    "Multiple DirectDraw wrappers enabled (%s); only one can provide ddraw.dll.",
-                    ", ".join(enabled_wrappers),
-                )
+        enabled_wrappers = [DDRAW_WRAPPER_LABELS[opt] for opt in DDRAW_PROVIDER_OPTIONS if self.runner_config.get(opt)]
+        if len(enabled_wrappers) > 1:
+            logger.warning(
+                "Multiple DirectDraw wrappers enabled (%s); only one can provide ddraw.dll.",
+                ", ".join(enabled_wrappers),
+            )
 
         for manager_class, enabled_option, version_option in manager_classes:
             enabled = bool(self.runner_config.get(enabled_option))
@@ -1446,12 +1485,6 @@ class wine(Runner):
                     enabled = False
 
                 if not manager.proton_compatible and is_proton:
-                    enabled = False
-
-                if enabled and manager_class is DXVKManager and ddraw_wrapper_active:
-                    # Wine builds with DXVK-based DDraw support (such as CachyOS
-                    # Wine) would use DXVK's DDraw instead of the wrapper.
-                    logger.warning("Disabling DXVK while a DirectDraw wrapper is enabled.")
                     enabled = False
 
                 if enabled or not enabled_only:
@@ -1541,7 +1574,7 @@ class wine(Runner):
         if self.runner_config.get("eac"):
             env["PROTON_EAC_RUNTIME"] = os.path.join(settings.RUNTIME_DIR, "eac_runtime")
 
-        using_dxvk = is_dxvk_effectively_enabled(self.runner_config) and LINUX_SYSTEM.is_vulkan_supported()
+        using_dxvk = self.runner_config.get("dxvk") and LINUX_SYSTEM.is_vulkan_supported()
         if not using_dxvk:
             env["PROTON_USE_WINED3D"] = "1"
 
@@ -1572,6 +1605,12 @@ class wine(Runner):
                 env["PROTON_ENABLE_HDR"] = "1"
 
         for dll_manager in self.get_dll_managers(enabled_only=True):
+            if not dll_manager.is_available():
+                logger.warning(
+                    "%s is enabled but its files are not downloaded; its DLL overrides will be skipped.",
+                    dll_manager.human_name,
+                )
+                continue
             self.dll_overrides.update(dll_manager.get_enabling_dll_overrides())
 
         overrides = self.get_dll_overrides()
@@ -1646,7 +1685,7 @@ class wine(Runner):
         game_exe = self.game_exe
         arguments: str = self.game_config.get("args", "")
         launch_info: dict = {"env": self.get_env(os_env=False)}
-        using_dxvk = is_dxvk_effectively_enabled(self.runner_config) and LINUX_SYSTEM.is_vulkan_supported()
+        using_dxvk = self.runner_config.get("dxvk") and LINUX_SYSTEM.is_vulkan_supported()
 
         if using_dxvk:
             # Set this to 1 to enable access to more RAM for 32-bit applications

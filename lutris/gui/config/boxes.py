@@ -218,7 +218,9 @@ class RunnerBox(ConfigBox):
         except InvalidRunnerError:
             self.runner = None
         if self.runner:
-            self.options = self.runner.get_runner_options()
+            # Config-tab options (DXVK Config, CnC-DDraw Config, ...) live
+            # on their own tabs (WrapperConfBox).
+            self.options = [o for o in self.runner.get_runner_options() if not o.get("config_tab")]
 
         if lutris_config.level == "game":
             self.generate_top_info_box(
@@ -230,6 +232,52 @@ class RunnerBox(ConfigBox):
         # we do not control, so let's keep up to date more aggresively.
         clear_wine_version_cache()
         return super().generate_widgets()
+
+
+class WrapperConfBox(ConfigBox):
+    """Configuration box for one wrapper config tab (DXVK Config, ...).
+
+    Shown on its own notebook tab while the wrapper's toggle is enabled;
+    the values are written to the game's config file on launch."""
+
+    config_section = "runner"
+
+    def __init__(
+        self,
+        config_level: str,
+        lutris_config: LutrisConfig,
+        game: Game | None = None,
+        tab_id: str | None = None,
+        info_text: str | None = None,
+        managed_keys=None,
+        writer=None,
+        **kwargs,
+    ):
+        ConfigBox.__init__(self, config_level, lutris_config, game, **kwargs)
+        self.tab_id = tab_id
+        self.managed_keys = managed_keys or frozenset()
+        self.writer = writer
+
+        try:
+            runner = import_runner(lutris_config.runner_slug)() if lutris_config.runner_slug else None
+        except InvalidRunnerError:
+            runner = None
+        if runner:
+            self.options = [o for o in runner.get_runner_options() if o.get("config_tab") == tab_id]
+
+        if lutris_config.level == "game" and info_text:
+            self.generate_top_info_box(info_text)
+
+    def generate_widgets(self):
+        super().generate_widgets()
+        # Priority 2000 runs after the saver (1000), so the cascade already
+        # holds the new value when this fires.
+        self.get_widget_generator().changed.register(self._on_conf_changed, priority=2000)
+
+    def _on_conf_changed(self, option_key, _new_value) -> None:
+        """Write-through: update the config file as soon as an option changes."""
+        if option_key in self.managed_keys and self.writer:
+            self.writer(self.lutris_config, self.game)
 
 
 class SystemConfigBox(ConfigBox):

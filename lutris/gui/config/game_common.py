@@ -11,21 +11,162 @@ from lutris import settings
 from lutris.config import LutrisConfig, make_game_config_id, rename_config
 from lutris.game import Game
 from lutris.gui.config import DIALOG_HEIGHT, DIALOG_WIDTH
-from lutris.gui.config.boxes import GameBox, RunnerBox, SystemConfigBox
+from lutris.gui.config.boxes import GameBox, RunnerBox, SystemConfigBox, WrapperConfBox
 from lutris.gui.config.game_info_box import GameInfoBox
 from lutris.gui.config.widget_generator import WidgetWarningMessageBox
 from lutris.gui.dialogs import DirectoryDialog, ErrorDialog, QuestionDialog, SavableModelessDialog, display_error
 from lutris.gui.dialogs.delegates import DialogInstallUIDelegate
 from lutris.gui.dialogs.move_game import MoveDialog
+from lutris.gui.widgets import EMPTY_NOTIFICATION_REGISTRATION
 from lutris.gui.widgets.notifications import send_notification
 from lutris.runners import import_runner
 from lutris.services.lutris import download_lutris_media
 from lutris.util.jobs import AsyncCall
 from lutris.util.log import logger
 from lutris.util.strings import parse_playtime, slugify
+from lutris.util.wine import cnc_ddraw_conf, dxvk_conf, dxwrapper_conf
 
 if TYPE_CHECKING:
     from lutris.gui.config.boxes import ConfigBox
+
+
+class _WrapperConfigTab:
+    """Manages one dynamically shown wrapper config tab (DXVK Config, ...).
+
+    The tab only exists while its toggle option (DXVK, CnC-DDraw, ...) is
+    enabled; toggling the option shows or hides it."""
+
+    def __init__(self, dialog, runner_index, order, flags, label, tab_id, info, managed_keys, writer):
+        self.dialog = dialog
+        self.runner_index = runner_index
+        self.order = order
+        self.flag_options = tuple(flags)
+        self.label_text = label
+        self.tab_id = tab_id
+        self.info_text = info
+        self.managed_keys = managed_keys
+        self.writer = writer
+        self.box = None
+        self.page = None
+        self.label_widget = None
+        self.visible = False
+        self.saved_trackers = {}
+        self.saved_sets = set()
+        self.registration = EMPTY_NOTIFICATION_REGISTRATION
+
+    def build(self):
+        dialog = self.dialog
+        self.registration.unregister()
+        if not dialog.lutris_config or dialog.lutris_config.runner_slug != "wine" or not dialog.runner_box:
+            return
+        self.box = dialog._build_options_tab(
+            self.label_text,
+            lambda: WrapperConfBox(
+                dialog.config_level,
+                dialog.lutris_config,
+                dialog.game,
+                tab_id=self.tab_id,
+                info_text=self.info_text,
+                managed_keys=self.managed_keys,
+                writer=self.writer,
+            ),
+        )
+        self.page = dialog.notebook.get_nth_page(dialog.notebook.get_n_pages() - 1)
+        self.label_widget = dialog.notebook.get_tab_label(self.page)
+        self.visible = True
+        self.sync()
+        # The runner page generates lazily; hook the toggle once its
+        # widgets (and their change notifications) exist. If it already
+        # generated (page 0), connect right away.
+        generator_entry = dialog.notebook_page_generators.get(self.runner_index)
+        if generator_entry is None:
+            self.connect()
+        else:
+
+            def generate_runner_then_connect():
+                generator_entry()
+                self.connect()
+
+            dialog.notebook_page_generators[self.runner_index] = generate_runner_then_connect
+
+    def connect(self) -> None:
+        """Listen for toggle changes to show or hide this tab."""
+        self.registration.unregister()
+        if self.dialog.runner_box is None:
+            return
+        generator = self.dialog.runner_box.get_widget_generator()
+        self.registration = generator.changed.register(self.on_flag_changed)
+
+    def is_wanted(self) -> bool:
+        if not self.dialog.lutris_config:
+            return False
+        return any(bool(self.dialog.lutris_config.runner_config.get(flag)) for flag in self.flag_options)
+
+    def on_flag_changed(self, option_key: str, new_value) -> None:
+        if option_key in self.flag_options:
+            # Use the toggled value directly: the config cascade is only
+            # updated after change handlers run.
+            self.sync(wanted=bool(new_value))
+            if new_value and self.writer:
+                self.writer(self.dialog.lutris_config, self.dialog.game)
+
+    def show_position(self) -> int:
+        """Notebook position for this tab: after the runner tab, ordered
+        among the other visible dynamic tabs."""
+        dialog = self.dialog
+        predecessors = sum(
+            1 for tab in dialog.wrapper_config_tabs if tab is not self and tab.visible and tab.order < self.order
+        )
+        return min(self.runner_index + 1 + predecessors, dialog.notebook.get_n_pages())
+
+    def sync(self, wanted: bool | None = None) -> None:
+        """Show or hide this tab to match its toggle option."""
+        if self.page is None:
+            return
+        if wanted is None:
+            wanted = self.is_wanted()
+        if wanted == self.visible:
+            return
+        dialog = self.dialog
+        if wanted:
+            index = self.show_position()
+            dialog._shift_notebook_indices(index, +1)
+            dialog.notebook.insert_page(self.page, self.label_widget, index)
+            self._restore_trackers(index)
+        else:
+            index = dialog.notebook.page_num(self.page)
+            if index < 0:
+                return
+            self._save_trackers(index)
+            dialog.notebook.remove_page(index)
+            dialog._shift_notebook_indices(index + 1, -1)
+        self.visible = wanted
+        self.box.show_all()
+
+    def _save_trackers(self, index: int) -> None:
+        """Stash this tab's widget bookkeeping before removing its page."""
+        dialog = self.dialog
+        self.saved_trackers = {}
+        for tracker in (dialog.notebook_page_generators, dialog.notebook_page_updater):
+            if index in tracker:
+                self.saved_trackers[id(tracker)] = tracker.pop(index)
+        self.saved_sets = set()
+        for index_set in (dialog.option_page_indices, dialog.searchable_page_indices):
+            if index in index_set:
+                index_set.discard(index)
+                self.saved_sets.add(id(index_set))
+
+    def _restore_trackers(self, index: int) -> None:
+        """Restore this tab's widget bookkeeping after re-inserting its page."""
+        dialog = self.dialog
+        for tracker in (dialog.notebook_page_generators, dialog.notebook_page_updater):
+            saved = self.saved_trackers.pop(id(tracker), None)
+            if saved is not None:
+                tracker[index] = saved
+        for index_set in (dialog.option_page_indices, dialog.searchable_page_indices):
+            if id(index_set) in self.saved_sets:
+                index_set.add(index)
+        self.saved_sets.clear()
 
 
 # pylint: disable=too-many-instance-attributes, no-member
@@ -54,6 +195,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         self.header_bar_widgets = []
         self.game_box = None
         self.system_box: SystemConfigBox = None
+        self.wrapper_config_tabs: list = []
         self.runner_name = None
         self.lutris_config: LutrisConfig = None
         self.notebook_page_generators = {}
@@ -95,6 +237,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             self._build_info_tab()
             self._build_game_tab()
         self._build_runner_tab()
+        self._build_wrapper_config_tabs()
         self._build_system_tab()
 
         current_page_index = self.notebook.get_current_page()
@@ -202,6 +345,64 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             )
         else:
             self._build_missing_options_tab(self.no_runner_label, _("Runner options"))
+
+    def _wrapper_config_tab_defs(self):
+        """Tab definitions for the wrapper config tabs (DXVK Config, ...)."""
+        return [
+            {
+                "flags": ("dxvk", "d7vk"),
+                "label": _("DXVK Config"),
+                "tab_id": "dxvk",
+                "info": _("These options are written to the game's dxvk.conf when DXVK is enabled."),
+                "managed_keys": dxvk_conf.MANAGED_KEYS,
+                "writer": dxvk_conf.write_managed_conf,
+            },
+            {
+                "flags": ("cnc_ddraw",),
+                "label": _("CnC-DDraw Config"),
+                "tab_id": "cnc_ddraw",
+                "info": _("These options are written to the game's ddraw.ini when CnC-DDraw is enabled."),
+                "managed_keys": cnc_ddraw_conf.MANAGED_KEYS,
+                "writer": cnc_ddraw_conf.write_managed_conf,
+            },
+            {
+                "flags": ("dxwrapper",),
+                "label": _("DxWrapper Config"),
+                "tab_id": "dxwrapper",
+                "info": _("These options are written to the game's dxwrapper.ini when DxWrapper is enabled."),
+                "managed_keys": dxwrapper_conf.MANAGED_KEYS,
+                "writer": dxwrapper_conf.write_managed_conf,
+            },
+        ]
+
+    def _build_wrapper_config_tabs(self) -> None:
+        """Builds the wrapper config tabs for the Wine runner.
+
+        Each tab only exists while its toggle (DXVK, CnC-DDraw, ...) is
+        enabled; toggling the option shows or hides it."""
+        self.wrapper_config_tabs = []
+        if not self.lutris_config or self.lutris_config.runner_slug != "wine" or not self.runner_box:
+            return
+        runner_index = self.notebook.get_n_pages() - 1
+        for order, tab_def in enumerate(self._wrapper_config_tab_defs()):
+            tab = _WrapperConfigTab(self, runner_index, order, **tab_def)
+            tab.build()
+            self.wrapper_config_tabs.append(tab)
+
+    def _shift_notebook_indices(self, start: int, delta: int) -> None:
+        """Shift tracked notebook page indices after inserting (+1) or
+        removing (-1) a wrapper config tab at the given index."""
+        # NB: shifting up must iterate downward (and vice versa), or
+        # pop-and-reinsert overwrites entries that have not moved yet.
+        for tracker in (self.notebook_page_generators, self.notebook_page_updater):
+            for index in sorted(tracker.keys(), reverse=delta > 0):
+                if index >= start:
+                    tracker[index + delta] = tracker.pop(index)
+        for index_set in (self.option_page_indices, self.searchable_page_indices):
+            for index in sorted(index_set, reverse=delta > 0):
+                if index >= start:
+                    index_set.discard(index)
+                    index_set.add(index + delta)
 
     def _build_system_tab(self) -> None:
         self.system_box = self._build_options_tab(
@@ -351,6 +552,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         self.searchable_page_indices.clear()
         self._build_game_tab()
         self._build_runner_tab()
+        self._build_wrapper_config_tabs()
         self._build_system_tab()
         self.show_all()
 
