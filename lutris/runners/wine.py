@@ -255,6 +255,38 @@ def _get_ddraw_wrapper_warning(option_key: str, config: LutrisConfig) -> str | N
     return None
 
 
+def is_sarek_available_for_version(version: str | None) -> bool:
+    """True if the Wine build ships DXVK-Sarek (a dxvk-sarek directory)."""
+    if not version:
+        return False
+    try:
+        files_dir = get_runner_files_dir_for_version(version)
+    except Exception as ex:  # noqa: BLE001 - unknown versions simply have no Sarek
+        logger.debug("Could not resolve files for Wine version %s: %s", version, ex)
+        return False
+    if not files_dir:
+        return False
+    return os.path.isdir(os.path.join(files_dir, "lib", "wine", "dxvk-sarek"))
+
+
+def _is_sarek_available(_option_key: str, config: LutrisConfig) -> bool:
+    version = config.runner_config.get("version") or get_default_wine_version()
+    return is_sarek_available_for_version(version)
+
+
+def _is_sarek_off(_option_key: str, config: LutrisConfig) -> bool:
+    return not bool(config.runner_config.get("sarek"))
+
+
+def _get_sarek_warning(_option_key: str, config: LutrisConfig) -> str | None:
+    if config.runner_config.get("sarek"):
+        return _(
+            "<b>Warning</b> DXVK-Sarek is enabled, so it supersedes the DXVK and D7VK toggles; "
+            "those DLLs will not be installed while Sarek is active."
+        )
+    return None
+
+
 def _get_d7vk_warning(option_key: str, config: LutrisConfig) -> str | None:
     runner_config = config.runner_config
     if not runner_config.get("d7vk"):
@@ -438,6 +470,7 @@ class wine(Runner):
             "label": _("Enable DXVK"),
             "type": "bool",
             "default": True,
+            "condition": _is_sarek_off,
             "warning": _get_dxvk_warning,
             "error": lambda k, c: _get_simple_vulkan_support_error(k, c, _("DXVK")),
             "active": True,
@@ -466,6 +499,7 @@ class wine(Runner):
             "label": _("Enable D7VK"),
             "type": "bool",
             "default": False,
+            "condition": _is_sarek_off,
             "warning": _get_d7vk_warning,
             "help": _(
                 "Use D7VK for Direct3D 7 and earlier 3D games: a minimal D3D7/6/5/3 "
@@ -482,6 +516,23 @@ class wine(Runner):
             "conditional_on": "d7vk",
             "choices": lambda: D7vkManager().version_choices,
             "default": lambda: D7vkManager().version,
+        },
+        {
+            "option": "sarek",
+            "section": _("Graphics"),
+            "label": _("Enable DXVK-Sarek"),
+            "type": "bool",
+            "default": False,
+            "advanced": True,
+            "visible": _is_sarek_available,
+            "warning": _get_sarek_warning,
+            "error": lambda k, c: _get_simple_vulkan_support_error(k, c, _("DXVK-Sarek")),
+            "help": _(
+                "Use the DXVK-Sarek fork bundled with this Wine build instead of DXVK. "
+                "Sarek targets pre-Vulkan-1.3 GPUs and includes DDraw support, so it "
+                "supersedes the DXVK and D7VK toggles while active. Only shown when "
+                "the selected Wine version ships Sarek, such as proton-cachyos."
+            ),
         },
         {
             "option": "vkd3d",
@@ -1448,6 +1499,13 @@ class wine(Runner):
         logger.info("Waiting %d seconds for client to be ready", wait_time)
         time.sleep(wait_time)
 
+    def is_sarek_active(self) -> bool:
+        """True if DXVK-Sarek is enabled and the Wine build ships it."""
+        if not self.runner_config.get("sarek"):
+            return False
+        version = self.runner_config.get("version") or get_default_wine_version()
+        return is_sarek_available_for_version(version)
+
     def get_dll_managers(self, enabled_only=False):
         """Returns the DLL managers in a dict; the keys are the managers themselves,
         and the values are the enabled flags for them. If 'enabled_only' is true,
@@ -1467,6 +1525,7 @@ class wine(Runner):
         managers = {}
         wine_exe = self.get_executable()
         is_proton = proton.is_proton_path(wine_exe) or proton.is_umu_path(wine_exe)
+        sarek_active = self.is_sarek_active()
 
         enabled_wrappers = [DDRAW_WRAPPER_LABELS[opt] for opt in DDRAW_PROVIDER_OPTIONS if self.runner_config.get(opt)]
         if len(enabled_wrappers) > 1:
@@ -1485,6 +1544,12 @@ class wine(Runner):
                     enabled = False
 
                 if not manager.proton_compatible and is_proton:
+                    enabled = False
+
+                if enabled and sarek_active and isinstance(manager, (DXVKManager, D7vkManager)):
+                    # Sarek ships its own DXVK fork including DDraw support,
+                    # so the DXVK and D7VK toggles stay off while it is active.
+                    logger.warning("Disabling %s while DXVK-Sarek is enabled.", manager.human_name)
                     enabled = False
 
                 if enabled or not enabled_only:
@@ -1574,12 +1639,16 @@ class wine(Runner):
         if self.runner_config.get("eac"):
             env["PROTON_EAC_RUNTIME"] = os.path.join(settings.RUNTIME_DIR, "eac_runtime")
 
-        using_dxvk = self.runner_config.get("dxvk") and LINUX_SYSTEM.is_vulkan_supported()
+        sarek_active = self.is_sarek_active()
+        using_dxvk = (self.runner_config.get("dxvk") or sarek_active) and LINUX_SYSTEM.is_vulkan_supported()
         if not using_dxvk:
             env["PROTON_USE_WINED3D"] = "1"
 
         if "PROTON_DXVK_D3D8" not in env:
             env["PROTON_DXVK_D3D8"] = "1" if using_dxvk else "0"
+
+        if sarek_active and "PROTON_DXVK_SAREK" not in env:
+            env["PROTON_DXVK_SAREK"] = "1"
 
         if (
             using_dxvk
@@ -1685,7 +1754,7 @@ class wine(Runner):
         game_exe = self.game_exe
         arguments: str = self.game_config.get("args", "")
         launch_info: dict = {"env": self.get_env(os_env=False)}
-        using_dxvk = self.runner_config.get("dxvk") and LINUX_SYSTEM.is_vulkan_supported()
+        using_dxvk = (self.runner_config.get("dxvk") or self.is_sarek_active()) and LINUX_SYSTEM.is_vulkan_supported()
 
         if using_dxvk:
             # Set this to 1 to enable access to more RAM for 32-bit applications
