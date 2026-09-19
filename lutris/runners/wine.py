@@ -910,6 +910,7 @@ class wine(Runner):
         """Return the contexual menu entries for wine"""
         return [
             ("wineexec", _("Run EXE inside Wine prefix"), self.run_wineexec),
+            ("winereg", _("Run REG inside Wine prefix"), self.run_winereg),
             ("wineshell", _("Open Bash terminal"), self.run_wine_terminal),
             ("wineconsole", _("Open Wine console"), self.run_wineconsole),
             (None, "-", None),
@@ -1229,6 +1230,30 @@ class wine(Runner):
             return
         self.prelaunch()
         self._run_executable(filename)
+
+    def run_winereg(self, *args):
+        """Ask the user for a .reg file to import into the game's prefix"""
+        dlg = FileDialog(_("Select a REG file to import"), default_path=self.game_path)
+        filename = dlg.filename
+        if not filename:
+            return
+        self.prelaunch()
+        wine_path = self.get_executable()
+        if self.wine_arch == "win64" and wine_path and system.path_exists(wine_path + "64"):
+            # Use wine64 by default if set to a 64bit prefix. Using regular wine
+            # will prevent some registry keys from being created. Most likely to be
+            # a bug in Wine. see: https://github.com/lutris/lutris/issues/804
+            wine_path = wine_path + "64"
+        wineexec(
+            "regedit",
+            args="/S '%s'" % filename,
+            wine_path=wine_path,
+            prefix=self.prefix_path,
+            arch=self.wine_arch,
+            config=self,
+            env=self.get_env(os_env=True),
+            runner=self,
+        )
 
     def run_wineconsole(self, *args):
         """Runs wineconsole inside wine prefix."""
