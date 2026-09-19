@@ -1,5 +1,6 @@
 """Injects sets of DLLs into a prefix"""
 
+import filecmp
 import json
 import os
 import shutil
@@ -26,6 +27,24 @@ class DLLManager:
     releases_url = NotImplemented
     archs = {32: "x32", 64: "x64"}
     proton_compatible = False  # Proton manages its own DLLs
+    known_versions: dict[str, str] = {}
+    # Pinned versions mapped to direct download URLs. These are always
+    # listed (and downloadable) without needing the versions file that is
+    # normally fetched through the runtime updater, so components the Lutris
+    # API does not serve yet still work out of the box.
+    game_files: dict[str, str] = {}
+    # Wrapper support files deployed next to the game (copies, never
+    # symlinks, so this also works on Windows filesystems). Maps a path
+    # relative to the version directory to the filename in the game
+    # directory. Files that already exist are never overwritten, so user
+    # tuning is preserved.
+    prefer_game_dir = False
+    # When True, the wrapper's DLLs are deployed as a version-matched set
+    # next to the game instead of into the prefix: Proton reinstalls its own
+    # DLLs into the prefix on updates (wiping foreign files), while the game
+    # directory is never touched and is also where upstream documents these
+    # wrappers to live. DLLs are always refreshed to the enabled version;
+    # config files from game_files are still never overwritten.
 
     def __init__(self, prefix=None, arch="win64", version=None):
         self.prefix = prefix
@@ -117,18 +136,22 @@ class DLLManager:
         return _choices
 
     def load_versions(self) -> list:
+        dll_versions = list(self.known_versions)
         if not system.path_exists(self.versions_path):
-            return []
+            return dll_versions
 
         with open(self.versions_path, "r", encoding="utf-8") as dll_version_file:
             try:
-                dll_versions = [v["tag_name"] for v in json.load(dll_version_file)]
+                file_versions = [v["tag_name"] for v in json.load(dll_version_file)]
             except (KeyError, json.decoder.JSONDecodeError):
                 logger.warning(
                     "Invalid versions file %s, deleting so it is downloaded on next start.", self.versions_path
                 )
                 os.remove(self.versions_path)
-                return []
+                return dll_versions
+        for file_version in file_versions:
+            if file_version not in dll_versions:
+                dll_versions.append(file_version)
 
         # Ensure the versions.json specified version is present and
         # is the default by moving it to the top.
@@ -163,6 +186,8 @@ class DLLManager:
 
     def get_download_url(self):
         """Fetch the download URL from the JSON version file"""
+        if self.version in self.known_versions:
+            return self.known_versions[self.version]
         with open(self.versions_path, "r", encoding="utf-8") as version_file:
             releases = json.load(version_file)
         for release in releases:
@@ -311,6 +336,94 @@ class DLLManager:
             self.disable_dll(system_dir, arch, dll)
         for appdata_dir, file, _filename in self._iter_appdata_files():
             self.disable_user_file(appdata_dir, file)
+
+    def deploy_game_dlls(self, game_dir):
+        """Deploy the wrapper's DLLs next to the game as a version-matched set.
+
+        Unlike prefix deployment this survives Proton prefix updates, and it
+        keeps stub and core DLLs (e.g. dxwrapper) at the same version.
+        DLLs are always refreshed to the enabled version. Returns True when
+        every managed DLL that exists locally was deployed."""
+        if not self.is_available():
+            logger.warning("%s is not available locally, skipping game DLLs.", self.human_name)
+            return False
+        if not system.path_exists(game_dir):
+            logger.warning("Game directory %s does not exist, skipping game DLLs.", game_dir)
+            return False
+        arch_dir = os.path.join(self.path, self.archs[32])
+        success = True
+        for dll in self.managed_dlls:
+            source = os.path.join(arch_dir, "%s.dll" % dll)
+            if not system.path_exists(source):
+                continue
+            dest = os.path.join(game_dir, "%s.dll" % dll)
+            try:
+                if system.path_exists(dest) and os.path.islink(dest):
+                    os.remove(dest)
+                shutil.copy2(source, dest)
+                logger.info("Deployed %s to %s.", "%s.dll" % dll, dest)
+            except OSError as ex:
+                logger.warning("Failed to deploy %s to %s: %s", source, dest, ex)
+                success = False
+        return success
+
+    def cleanup_game_dlls(self, game_dir, keep=()):
+        """Remove this wrapper's game-dir DLLs left from earlier use, e.g.
+        after switching to another wrapper.
+
+        Only removes files Lutris deployed itself (byte-identical to the
+        local copy), never files owned by an enabled wrapper (keep) and
+        never user data."""
+        if not self.is_available():
+            return
+        arch_dir = os.path.join(self.path, self.archs[32])
+        for dll in self.managed_dlls:
+            filename = "%s.dll" % dll
+            if filename in keep:
+                continue
+            source = os.path.join(arch_dir, filename)
+            dest = os.path.join(game_dir, filename)
+            if not system.path_exists(source) or not system.path_exists(dest):
+                continue
+            try:
+                if os.path.islink(dest) or not filecmp.cmp(source, dest, shallow=False):
+                    continue
+                os.remove(dest)
+                logger.info("Removed stale %s.", dest)
+            except OSError as ex:
+                logger.warning("Failed to remove stale %s: %s", dest, ex)
+
+    def deploy_game_files(self, game_dir):
+        """Copy wrapper support files (configs, shaders) next to the game.
+
+        Only deploys when the component is available locally, and never
+        overwrites files that already exist, so user tuning is preserved.
+        Game-dir files are left in place when the wrapper is disabled."""
+        if not self.game_files:
+            return
+        if not self.is_available():
+            logger.warning("%s is not available locally, skipping game files.", self.human_name)
+            return
+        if not system.path_exists(game_dir):
+            logger.warning("Game directory %s does not exist, skipping game files.", game_dir)
+            return
+        for source_rel, dest_name in self.game_files.items():
+            source = os.path.join(self.path, source_rel)
+            if not system.path_exists(source):
+                logger.debug("Optional %s file %s not found, skipping.", self.human_name, source_rel)
+                continue
+            dest = os.path.join(game_dir, dest_name)
+            if system.path_exists(dest):
+                logger.debug("Keeping existing %s.", dest)
+                continue
+            try:
+                if os.path.isdir(source):
+                    shutil.copytree(source, dest)
+                else:
+                    shutil.copy2(source, dest)
+                logger.info("Deployed %s to %s.", source_rel, dest)
+            except OSError as ex:
+                logger.warning("Failed to deploy %s to %s: %s", source, dest, ex)
 
     def fetch_versions(self):
         """Get releases from GitHub"""

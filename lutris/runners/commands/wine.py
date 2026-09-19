@@ -416,7 +416,7 @@ def wineexec(
     # Create prefix if necessary
     if arch not in ("win32", "win64"):
         arch = detect_arch(prefix, wine_path)
-    if not is_prefix_directory(prefix):
+    if prefix and not is_prefix_directory(prefix):
         wine_bin = winetricks_wine if winetricks_wine and not proton.is_proton_path(wine_path) else wine_path
         create_prefix(prefix, wine_path=wine_bin, arch=arch, runner=runner)
 

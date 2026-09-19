@@ -41,3 +41,6 @@ CLAUDE.md
 
 # glade recovery files
 *.ui~
+
+# local dev helper (not part of the project)
+/install.sh

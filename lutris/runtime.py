@@ -22,10 +22,13 @@ from lutris.util.jobs import AsyncCall
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
 from lutris.util.strings import parse_version
+from lutris.util.wine.cnc_ddraw import CncDdrawManager
 from lutris.util.wine.d3d_extras import D3DExtrasManager
 from lutris.util.wine.dgvoodoo2 import dgvoodoo2Manager
+from lutris.util.wine.dxgl import DxglManager
 from lutris.util.wine.dxvk import DXVKManager
 from lutris.util.wine.dxvk_nvapi import DXVKNVAPIManager
+from lutris.util.wine.dxwrapper import DxWrapperManager
 from lutris.util.wine.vkd3d import VKD3DManager
 
 RUNTIME_DISABLED = os.environ.get("LUTRIS_RUNTIME", "").casefold() in ("0", "off")
@@ -37,6 +40,9 @@ DLL_MANAGERS = {
     "d3d_extras": D3DExtrasManager,
     "dgvoodoo2": dgvoodoo2Manager,
     "dxvk_nvapi": DXVKNVAPIManager,
+    "dxwrapper": DxWrapperManager,
+    "dxgl": DxglManager,
+    "cnc_ddraw": CncDdrawManager,
 }
 
 
