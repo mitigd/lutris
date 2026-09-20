@@ -311,12 +311,11 @@ def write_cnc_ddraw_conf(game_dir, values):
         except OSError as ex:
             logger.warning("Failed to back up %s: %s", path, ex)
     merged = merge_conf(entries, values)
+    # Never delete config files: if nothing remains, leave a marker comment
+    # so stale managed lines are still cleared without removing the file.
+    if not merged:
+        merged = MANAGED_MARKER + "\n"
     try:
-        if not merged:
-            if system.path_exists(path):
-                os.remove(path)
-                logger.info("Removed empty %s.", path)
-            return True
         with open(path, "w", encoding="utf-8") as conf_file:
             conf_file.write(merged)
         logger.info("Wrote %s with %d managed option(s).", path, len(values))
@@ -324,6 +323,56 @@ def write_cnc_ddraw_conf(game_dir, values):
         logger.warning("Failed to write %s: %s", path, ex)
         return False
     return True
+
+
+def _gui_bool(text):
+    """Convert a conf bool to a GUI bool; None when unrecognized."""
+    normalized = text.strip().casefold()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off", ""):
+        return False
+    return None
+
+
+def read_managed_values(game):
+    """Read managed ddraw.ini values for the GUI to adopt.
+
+    Only keys under the global [ddraw] section are considered; per-game
+    sections are upstream's database and are never adopted."""
+    game_dir = resolve_game_dir(game)
+    if not game_dir:
+        return {}
+    path = os.path.join(game_dir, CONF_FILENAME)
+    if not system.path_exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as conf_file:
+            entries = parse_conf(conf_file.read())
+    except OSError as ex:
+        logger.debug("Could not read %s: %s", path, ex)
+        return {}
+    by_key = {spec["key"]: spec for spec in CNC_DDRAW_CONF_SPEC}
+    values = {}
+    for entry in entries:
+        if entry[0] != "kv":
+            continue
+        _kind, section, key, value, _managed, _line = entry
+        if section.strip().casefold() != "[ddraw]":
+            continue
+        spec = by_key.get(key)
+        if spec is None:
+            continue
+        kind = spec["type"]
+        if kind == "bool":
+            converted = _gui_bool(value)
+        elif kind == "choice":
+            converted = value if value in spec["choices"] else None
+        else:
+            converted = value
+        if converted is not None:
+            values[key] = converted
+    return values
 
 
 def resolve_game_dir(game):

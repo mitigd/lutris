@@ -1,11 +1,12 @@
 """Shared config dialog stuff"""
 
 # pylint: disable=not-an-iterable
+import os
 from collections.abc import Callable
 from gettext import gettext as _
 from typing import TYPE_CHECKING
 
-from gi.repository import Gtk
+from gi.repository import GLib, Gtk
 
 from lutris import settings
 from lutris.config import LutrisConfig, make_game_config_id, rename_config
@@ -36,11 +37,12 @@ class _WrapperConfigTab:
     The tab only exists while its toggle option (DXVK, CnC-DDraw, ...) is
     enabled; toggling the option shows or hides it."""
 
-    def __init__(self, dialog, runner_index, order, flags, label, tab_id, info, managed_keys, writer):
+    def __init__(self, dialog, runner_index, order, flags, label, tab_id, info, managed_keys, writer, reader=None):
         self.dialog = dialog
         self.runner_index = runner_index
         self.order = order
         self.flag_options = tuple(flags)
+        self.reader = reader
         self.label_text = label
         self.tab_id = tab_id
         self.info_text = info
@@ -54,11 +56,38 @@ class _WrapperConfigTab:
         self.saved_sets = set()
         self.registration = EMPTY_NOTIFICATION_REGISTRATION
 
+    def adopt_existing_values(self) -> None:
+        """Adopt game-dir config values the user never set in Lutris.
+
+        When a config file is already there (hand-written before Lutris
+        managed it), its values show up in the tab instead of defaults.
+        Keys already present in the runner config are never overridden."""
+        dialog = self.dialog
+        if not self.reader or not dialog.game or not dialog.lutris_config:
+            return
+        try:
+            values = self.reader(dialog.game)
+        except Exception as ex:
+            logger.debug("Could not read existing config values: %s", ex)
+            return
+        if not values:
+            return
+        raw = dialog.lutris_config.raw_runner_config
+        adopted = 0
+        for key, value in values.items():
+            if key not in raw:
+                raw[key] = value
+                adopted += 1
+        if adopted:
+            dialog.lutris_config.update_cascaded_config()
+            logger.info("Adopted %d existing option(s) into the %s tab.", adopted, self.label_text)
+
     def build(self):
         dialog = self.dialog
         self.registration.unregister()
         if not dialog.lutris_config or dialog.lutris_config.runner_slug != "wine" or not dialog.runner_box:
             return
+        self.adopt_existing_values()
         self.box = dialog._build_options_tab(
             self.label_text,
             lambda: WrapperConfBox(
@@ -343,8 +372,75 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             self.runner_box = self._build_options_tab(
                 _("Runner options"), lambda: RunnerBox(self.config_level, self.lutris_config)
             )
+            self._connect_runner_dll_cleanup()
         else:
             self._build_missing_options_tab(self.no_runner_label, _("Runner options"))
+
+    def _connect_runner_dll_cleanup(self) -> None:
+        """Remove deployed DLLs as soon as a toggle is switched off, instead
+        of waiting for the next launch."""
+        if not self.lutris_config or self.lutris_config.runner_slug != "wine" or not self.runner_box:
+            return
+        runner_index = self.notebook.get_n_pages() - 1
+        generator_entry = self.notebook_page_generators.get(runner_index)
+        if generator_entry is None:
+            self._hook_runner_dll_cleanup()
+        else:
+
+            def generate_runner_then_hook():
+                generator_entry()
+                self._hook_runner_dll_cleanup()
+
+            self.notebook_page_generators[runner_index] = generate_runner_then_hook
+
+    def _hook_runner_dll_cleanup(self) -> None:
+        if self.runner_box is None:
+            return
+        try:
+            generator = self.runner_box.get_widget_generator()
+        except RuntimeError:
+            return
+        generator.changed.register(self._on_runner_dll_toggle, priority=2000)
+
+    def _on_runner_dll_toggle(self, option_key: str, new_value) -> None:
+        from lutris.runners.wine import DLL_CLEANUP_TRIGGERS
+
+        if option_key not in DLL_CLEANUP_TRIGGERS:
+            return
+        try:
+            runner = import_runner("wine")(self.lutris_config)
+        except Exception as ex:
+            logger.warning("DLL sync after toggle failed: %s", ex)
+            return
+        if new_value:
+            runner.deploy_enabled_dlls(confirmer=self._confirm_dll_replace)
+        else:
+            runner.cleanup_disabled_dlls()
+
+    def _confirm_dll_replace(self, dest_path: str, label: str) -> bool:
+        """Ask whether a differing game-dir file may be replaced. Runs on
+        the main thread; any failure keeps the existing file."""
+        try:
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.NONE,
+                text=_("Replace existing file?"),
+            )
+            dialog.format_secondary_markup(
+                _("<b>%s</b> already exists in the game folder.\n\nReplace it with the %s version?")
+                % (GLib.markup_escape_text(os.path.basename(dest_path)), label)
+            )
+            dialog.add_button(_("_Keep mine"), Gtk.ResponseType.NO)
+            dialog.add_button(_("_Replace"), Gtk.ResponseType.YES)
+            dialog.set_default_response(Gtk.ResponseType.YES)
+            response = dialog.run()
+            dialog.destroy()
+            return response == Gtk.ResponseType.YES
+        except Exception as ex:
+            logger.warning("Replace prompt failed, keeping %s: %s", dest_path, ex)
+            return False
 
     def _wrapper_config_tab_defs(self):
         """Tab definitions for the wrapper config tabs (DXVK Config, ...)."""
@@ -356,6 +452,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
                 "info": _("These options are written to the game's dxvk.conf when DXVK is enabled."),
                 "managed_keys": dxvk_conf.MANAGED_KEYS,
                 "writer": dxvk_conf.write_managed_conf,
+                "reader": dxvk_conf.read_managed_values,
             },
             {
                 "flags": ("cnc_ddraw",),
@@ -364,6 +461,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
                 "info": _("These options are written to the game's ddraw.ini when CnC-DDraw is enabled."),
                 "managed_keys": cnc_ddraw_conf.MANAGED_KEYS,
                 "writer": cnc_ddraw_conf.write_managed_conf,
+                "reader": cnc_ddraw_conf.read_managed_values,
             },
             {
                 "flags": ("dxwrapper",),
@@ -372,6 +470,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
                 "info": _("These options are written to the game's dxwrapper.ini when DxWrapper is enabled."),
                 "managed_keys": dxwrapper_conf.MANAGED_KEYS,
                 "writer": dxwrapper_conf.write_managed_conf,
+                "reader": dxwrapper_conf.read_managed_values,
             },
         ]
 

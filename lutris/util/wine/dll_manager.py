@@ -306,9 +306,10 @@ class DLLManager:
         overrides = {}
 
         for dll in self.managed_dlls:
-            # We have to make sure that the dll exists before setting it to native
+            # We have to make sure that the dll exists before setting it to native.
+            # Native-then-builtin: wrappers require native first with a builtin fallback.
             if self.dll_exists(dll):
-                overrides[dll] = "n"
+                overrides[dll] = "n,b"
 
         return overrides
 
@@ -337,13 +338,35 @@ class DLLManager:
         for appdata_dir, file, _filename in self._iter_appdata_files():
             self.disable_user_file(appdata_dir, file)
 
-    def deploy_game_dlls(self, game_dir):
+    def _copy_with_confirm(self, source, dest, confirmer=None, label=None):
+        """Copy source to dest, asking first when dest exists with different content.
+
+        Returns True when the file was deployed (or was already correct),
+        None when the user kept their file, False on failure. Symlinks are
+        always replaced without asking; they can only be Lutris leftovers."""
+        try:
+            if system.path_exists(dest):
+                if os.path.islink(dest):
+                    os.remove(dest)
+                elif filecmp.cmp(source, dest, shallow=False):
+                    return True
+                elif confirmer and not confirmer(dest, label or os.path.basename(dest)):
+                    logger.info("Keeping existing %s.", dest)
+                    return None
+            shutil.copy2(source, dest)
+            logger.info("Deployed %s to %s.", os.path.basename(source), dest)
+            return True
+        except OSError as ex:
+            logger.warning("Failed to deploy %s to %s: %s", source, dest, ex)
+            return False
+
+    def deploy_game_dlls(self, game_dir, exe_path=None, confirmer=None):
         """Deploy the wrapper's DLLs next to the game as a version-matched set.
 
         Unlike prefix deployment this survives Proton prefix updates, and it
         keeps stub and core DLLs (e.g. dxwrapper) at the same version.
-        DLLs are always refreshed to the enabled version. Returns True when
-        every managed DLL that exists locally was deployed."""
+        Returns True when the game-dir route was viable; per-file failures
+        are logged (the caller may fall back to prefix deployment)."""
         if not self.is_available():
             logger.warning("%s is not available locally, skipping game DLLs.", self.human_name)
             return False
@@ -351,21 +374,15 @@ class DLLManager:
             logger.warning("Game directory %s does not exist, skipping game DLLs.", game_dir)
             return False
         arch_dir = os.path.join(self.path, self.archs[32])
-        success = True
+        failed = False
         for dll in self.managed_dlls:
             source = os.path.join(arch_dir, "%s.dll" % dll)
             if not system.path_exists(source):
                 continue
             dest = os.path.join(game_dir, "%s.dll" % dll)
-            try:
-                if system.path_exists(dest) and os.path.islink(dest):
-                    os.remove(dest)
-                shutil.copy2(source, dest)
-                logger.info("Deployed %s to %s.", "%s.dll" % dll, dest)
-            except OSError as ex:
-                logger.warning("Failed to deploy %s to %s: %s", source, dest, ex)
-                success = False
-        return success
+            if self._copy_with_confirm(source, dest, confirmer, "%s %s.dll" % (self.human_name, dll)) is False:
+                failed = True
+        return not failed
 
     def cleanup_game_dlls(self, game_dir, keep=()):
         """Remove this wrapper's game-dir DLLs left from earlier use, e.g.

@@ -3,6 +3,7 @@
 # pylint: disable=too-many-lines
 import os
 import shlex
+import threading
 from collections.abc import Iterable
 from gettext import gettext as _
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,7 @@ from lutris.runners.runner import RunDataDict, Runner
 from lutris.util import system
 from lutris.util.display import DISPLAY_MANAGER, get_default_dpi, is_display_x11
 from lutris.util.graphics import drivers, vkquery
+from lutris.util.jobs import AsyncCall
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
 from lutris.util.process import Process
@@ -232,6 +234,25 @@ def _get_dxvk_version_warning(_option_key: str, config: LutrisConfig) -> str | N
 # on Wine builds with DXVK-based DDraw such as CachyOS Wine (d7vk).
 DDRAW_PROVIDER_OPTIONS = ("dgvoodoo2", "dxwrapper", "dxgl", "cnc_ddraw", "d7vk")
 
+# All DLL managers with their toggle and version options: (manager class,
+# enabled option, version option). Game-dir deployment for these is available
+# without a prefix; keep this as the single list get_dll_managers uses.
+DLL_MANAGER_CLASSES = [
+    (DXVKManager, "dxvk", "dxvk_version"),
+    (D7vkManager, "d7vk", "d7vk_version"),
+    (VKD3DManager, "vkd3d", "vkd3d_version"),
+    (DXVKNVAPIManager, "dxvk_nvapi", "dxvk_nvapi_version"),
+    (D3DExtrasManager, "d3d_extras", "d3d_extras_version"),
+    (dgvoodoo2Manager, "dgvoodoo2", "dgvoodoo2_version"),
+    (DxWrapperManager, "dxwrapper", "dxwrapper_version"),
+    (DxglManager, "dxgl", "dxgl_version"),
+    (CncDdrawManager, "cnc_ddraw", "cnc_ddraw_version"),
+]
+
+# Tracks in-flight background downloads so rapid toggling can't start two
+# downloads of the same component.
+_DLL_DEPLOY_LOCKS: dict[str, threading.Lock] = {}
+
 DDRAW_WRAPPER_LABELS = {
     "dgvoodoo2": "dgvoodoo2",
     "dxwrapper": "DxWrapper",
@@ -239,6 +260,10 @@ DDRAW_WRAPPER_LABELS = {
     "cnc_ddraw": "CnC-DDraw",
     "d7vk": "D7VK",
 }
+
+# Runner toggles whose switch-off immediately cleans up deployed files
+# (the launch-time prelaunch path remains the backstop).
+DLL_CLEANUP_TRIGGERS = ("dxvk", "dxwrapper", "dxgl", "cnc_ddraw", "d7vk")
 
 
 def _get_ddraw_wrapper_warning(option_key: str, config: LutrisConfig) -> str | None:
@@ -1444,13 +1469,7 @@ class wine(Runner):
         # games running in umu's default prefix. Game-dir deployment
         # survives Proton prefix updates, which reinstall Proton's own DLLs;
         # clear any prefix remnants so the two cannot mix versions.
-        game_dir = None
-        if self.game_exe:
-            game_dir = os.path.dirname(self.game_exe)
-        if not game_dir or not os.path.isdir(game_dir):
-            game_dir = self.working_dir
-        if not game_dir or not os.path.isdir(game_dir):
-            game_dir = None
+        game_dir = self._get_game_dll_dir()
         enabled_game_dlls = set()
         for manager, enabled in managers.items():
             if enabled and manager.prefer_game_dir:
@@ -1467,15 +1486,7 @@ class wine(Runner):
                 if prefix_path:
                     manager.setup(False)
                 continue
-            if game_dir and manager.deploy_game_dlls(game_dir):
-                manager.deploy_game_files(game_dir)
-                if prefix_path:
-                    manager.setup(False)
-            elif prefix_path:
-                # Game dir unusable: fall back to prefix deployment.
-                manager.setup(True)
-            else:
-                logger.warning("Cannot deploy %s: no game directory and no prefix.", manager.human_name)
+            self._deploy_manager(manager, game_dir, prefix_path, self.game_exe)
 
         # DXVK and D7VK read dxvk.conf from the game directory; write the
         # managed options there. Needs no prefix either.
@@ -1524,6 +1535,146 @@ class wine(Runner):
         logger.info("Waiting %d seconds for client to be ready", wait_time)
         time.sleep(wait_time)
 
+    def _get_game_dll_dir(self) -> str | None:
+        """Directory the game-dir wrappers deploy into (exe dir, else working dir)."""
+        game_dir = None
+        if self.game_exe:
+            game_dir = os.path.dirname(self.game_exe)
+        if not game_dir or not os.path.isdir(game_dir):
+            game_dir = self.working_dir
+        if not game_dir or not os.path.isdir(game_dir):
+            return None
+        return game_dir
+
+    def cleanup_disabled_dlls(self) -> None:
+        """Immediately remove files deployed for currently-disabled DLL managers.
+
+        Used when a toggle is switched off in the GUI so disabled components
+        don't linger until the next launch. Only removes Lutris-deployed
+        files (game-dir cleanup is byte-compared, prefix cleanup restores
+        backed-up originals); user data is never touched. All failures are
+        logged, never raised."""
+        try:
+            managers = self.get_dll_managers()
+        except Exception as ex:
+            logger.debug("Skipping DLL cleanup: %s", ex)
+            return
+        try:
+            game_dir = self._get_game_dll_dir()
+        except Exception as ex:
+            logger.debug("Skipping game-dir DLL cleanup: %s", ex)
+            game_dir = None
+        try:
+            prefix_path = self.prefix_path
+        except Exception as ex:
+            logger.debug("Skipping prefix DLL cleanup: %s", ex)
+            prefix_path = None
+        enabled_game_dlls = set()
+        for manager, enabled in managers.items():
+            if enabled and manager.prefer_game_dir:
+                enabled_game_dlls.update("%s.dll" % dll for dll in manager.managed_dlls)
+        for manager, enabled in managers.items():
+            if enabled:
+                continue
+            try:
+                if manager.prefer_game_dir:
+                    if game_dir:
+                        manager.cleanup_game_dlls(game_dir, keep=enabled_game_dlls)
+                elif prefix_path:
+                    manager.setup(False)
+            except Exception as ex:
+                logger.warning("Failed to clean up %s: %s", manager.human_name, ex)
+
+    def _deploy_manager(
+        self, manager, game_dir: str | None, prefix_path: str | None, exe_path=None, confirmer=None
+    ) -> bool:
+        """Deploy one enabled manager (game dir preferred, prefix fallback).
+
+        confirmer(dest, label) is called on the main thread before replacing
+        an existing differing file; it must return True to replace. None
+        means replace without asking (game launch path)."""
+        if manager.prefer_game_dir:
+            if game_dir and manager.deploy_game_dlls(game_dir, exe_path, confirmer):
+                manager.deploy_game_files(game_dir)
+                if prefix_path:
+                    manager.setup(False)
+                return True
+            if prefix_path:
+                manager.setup(True)
+                return True
+            logger.warning("Cannot deploy %s: no game directory and no prefix.", manager.human_name)
+            return False
+        if prefix_path:
+            manager.setup(True)
+            return True
+        return False
+
+    def deploy_enabled_dlls(self, confirmer=None) -> None:
+        """Deploy files for currently-enabled DLL managers right away.
+
+        Used when a toggle is switched on in the GUI so enabling takes
+        effect without waiting for the next launch. Components already
+        cached deploy synchronously; missing ones download in a worker
+        thread and deploy on completion (without asking again). All
+        failures are logged (and notified on download failure), never raised."""
+        try:
+            managers = self.get_dll_managers(enabled_only=True)
+        except Exception as ex:
+            logger.debug("Skipping DLL deploy: %s", ex)
+            return
+        try:
+            game_dir = self._get_game_dll_dir()
+        except Exception as ex:
+            logger.debug("Skipping game-dir DLL deploy: %s", ex)
+            game_dir = None
+        try:
+            prefix_path = self.prefix_path
+        except Exception as ex:
+            logger.debug("Skipping prefix DLL deploy: %s", ex)
+            prefix_path = None
+        try:
+            exe_path = self.game_exe
+        except Exception as ex:
+            logger.debug("Skipping exe detection: %s", ex)
+            exe_path = None
+        for manager, _enabled in managers.items():
+            try:
+                if manager.is_available():
+                    self._deploy_manager(manager, game_dir, prefix_path, exe_path, confirmer)
+                else:
+                    self._fetch_manager_in_background(manager)
+            except Exception as ex:
+                logger.warning("Failed to deploy %s: %s", manager.human_name, ex)
+
+    def _fetch_manager_in_background(self, manager) -> None:
+        """Download a missing component in a worker thread, then deploy it."""
+        lock = _DLL_DEPLOY_LOCKS.setdefault(manager.name, threading.Lock())
+        if not lock.acquire(blocking=False):
+            logger.debug("Download of %s already in progress.", manager.human_name)
+            return
+        logger.info("Downloading %s in the background...", manager.human_name)
+
+        def done(result, error, _manager=manager, _lock=lock):
+            try:
+                if error or not result:
+                    logger.warning("Failed to download %s: %s", _manager.human_name, error or "unknown")
+                    try:
+                        from lutris.gui.widgets.notifications import send_notification
+
+                        send_notification(
+                            _("Download failed"),
+                            _("Could not download %s.") % _manager.human_name,
+                        )
+                    except Exception as notify_ex:
+                        logger.debug("Notification failed: %s", notify_ex)
+                    return
+                logger.info("Downloaded %s, deploying...", _manager.human_name)
+                self.deploy_enabled_dlls()
+            finally:
+                _lock.release()
+
+        AsyncCall(manager.download, done)
+
     def is_sarek_active(self) -> bool:
         """True if DXVK-Sarek is enabled and the Wine build ships it."""
         if not self.runner_config.get("sarek"):
@@ -1535,18 +1686,6 @@ class wine(Runner):
         """Returns the DLL managers in a dict; the keys are the managers themselves,
         and the values are the enabled flags for them. If 'enabled_only' is true,
         only enabled managers are returned, so disabled managers are not created."""
-        manager_classes = [
-            (DXVKManager, "dxvk", "dxvk_version"),
-            (D7vkManager, "d7vk", "d7vk_version"),
-            (VKD3DManager, "vkd3d", "vkd3d_version"),
-            (DXVKNVAPIManager, "dxvk_nvapi", "dxvk_nvapi_version"),
-            (D3DExtrasManager, "d3d_extras", "d3d_extras_version"),
-            (dgvoodoo2Manager, "dgvoodoo2", "dgvoodoo2_version"),
-            (DxWrapperManager, "dxwrapper", "dxwrapper_version"),
-            (DxglManager, "dxgl", "dxgl_version"),
-            (CncDdrawManager, "cnc_ddraw", "cnc_ddraw_version"),
-        ]
-
         managers = {}
         wine_exe = self.get_executable()
         is_proton = proton.is_proton_path(wine_exe) or proton.is_umu_path(wine_exe)
@@ -1559,7 +1698,7 @@ class wine(Runner):
                 ", ".join(enabled_wrappers),
             )
 
-        for manager_class, enabled_option, version_option in manager_classes:
+        for manager_class, enabled_option, version_option in DLL_MANAGER_CLASSES:
             enabled = bool(self.runner_config.get(enabled_option))
             version = self.runner_config.get(version_option)
             if enabled or not enabled_only:
