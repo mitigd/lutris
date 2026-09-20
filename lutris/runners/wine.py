@@ -2,6 +2,7 @@
 
 # pylint: disable=too-many-lines
 import os
+import re
 import shlex
 import threading
 from collections.abc import Iterable
@@ -353,17 +354,6 @@ def _get_fsync_warning(_option_key: str, config: LutrisConfig) -> str | None:
         if not fsync_supported:
             return _("<b>Warning</b> Your kernel is not patched for fsync.")
     return None
-
-
-def _get_virtual_desktop_warning(_option_key: str, config: LutrisConfig) -> str | None:
-    message = _("Wine virtual desktop is no longer supported")
-    runner_config = config.runner_config
-    if runner_config.get("Desktop"):
-        version = str(runner_config.get("version")).casefold()
-        if "-ge-" in version or "proton" in version:
-            message += "\n"
-            message += _("Virtual desktops cannot be enabled in Proton or GE Wine versions.")
-    return message
 
 
 def _get_wine_wayland_warning(_option_key: str, config: LutrisConfig) -> str | None:
@@ -803,13 +793,11 @@ class wine(Runner):
             "label": _("Windowed (virtual desktop)"),
             "type": "bool",
             "advanced": True,
-            "visible": _is_pre_proton,
-            "warning": _get_virtual_desktop_warning,
             "default": False,
             "help": _(
-                "Run the whole Windows desktop in a window.\n"
+                "Run the game in a virtual desktop window sized below.\n"
                 "Otherwise, run it fullscreen.\n"
-                "This corresponds to Wine's Virtual Desktop option."
+                "Session scoped: nothing is stored in the prefix, so other games are unaffected."
             ),
         },
         {
@@ -817,7 +805,6 @@ class wine(Runner):
             "section": _("Virtual Desktop"),
             "label": _("Virtual desktop resolution"),
             "type": "choice_with_entry",
-            "visible": _is_pre_proton,
             "conditional_on": "Desktop",
             "advanced": True,
             "choices": DISPLAY_MANAGER.get_resolutions,
@@ -942,8 +929,6 @@ class wine(Runner):
         "Audio": r"%s/Drivers" % reg_prefix,
         "Graphics": r"%s/Drivers" % reg_prefix,
         "MouseWarpOverride": r"%s/DirectInput" % reg_prefix,
-        "Desktop": "MANAGED",
-        "WineDesktop": "MANAGED",
         "ShowCrashDialog": "MANAGED",
     }
 
@@ -1396,8 +1381,6 @@ class wine(Runner):
         # any calls to regedit.
         managed_keys = {
             "ShowCrashDialog": prefix_manager.set_crash_dialogs,
-            "Desktop": prefix_manager.set_virtual_desktop,
-            "WineDesktop": prefix_manager.set_desktop_size,
         }
         for key, path in self.reg_keys.items():
             value = self.runner_config.get(key) or "auto"
@@ -1416,18 +1399,6 @@ class wine(Runner):
                 if key in managed_keys:
                     # Do not pass fallback 'auto' value to managed keys
                     if value == "auto":
-                        value = None
-                    wine_exe = self.get_executable()
-                    if (
-                        value
-                        and key in ("Desktop", "WineDesktop")
-                        and (
-                            proton.is_umu_path(wine_exe)
-                            or proton.is_proton_path(wine_exe)
-                            or "wine-ge" in wine_exe.casefold()
-                        )
-                    ):
-                        logger.warning("Wine Virtual Desktop can't be used with Wine-GE and Proton")
                         value = None
                     managed_keys[key](value)
                     continue
@@ -1986,8 +1957,34 @@ class wine(Runner):
         if arguments:
             for arg in split_arguments(arguments):
                 command.append(arg)
+
+        if self.runner_config.get("Desktop"):
+            # Session-scoped virtual desktop: run the game inside an
+            # explorer desktop window. Nothing is stored in the prefix,
+            # so other games are unaffected once this game closes.
+            command = self._wrap_virtual_desktop(command, launch_info["env"])
+
         launch_info["command"] = command
         return launch_info
+
+    def _wrap_virtual_desktop(self, command: list, env: dict) -> list:
+        """Wrap the game command in a Wine virtual desktop window.
+
+        Inserts 'explorer /desktop=name,WxH' between the Wine executable
+        and the game. Works for plain Wine and umu/Proton alike."""
+        if not command:
+            return command
+        resolution = self.runner_config.get("WineDesktop") or ""
+        if not re.match(r"^\d+x\d+$", resolution.strip()):
+            if resolution:
+                logger.warning("Invalid virtual desktop resolution '%s', using the current one.", resolution)
+            resolution = "x".join(DISPLAY_MANAGER.get_current_resolution())
+        game_exe = self.game_exe or ""
+        stem = os.path.splitext(os.path.basename(game_exe))[0]
+        desktop_name = "".join(char for char in stem if char.isalnum() or char == "_") or "lutris"
+        logger.info("Running in a %s virtual desktop.", resolution)
+        env["STEAM_COMPAT_INSTALL_PATH"] = os.path.dirname(os.path.abspath(game_exe)) if game_exe else ""
+        return [command[0], "explorer", "/desktop=%s,%s" % (desktop_name, resolution)] + command[1:]
 
     def filter_game_pids(self, candidate_pids: Iterable[int], game_uuid: str, game_folder: str) -> set[int]:
         """Checks the pids given and returns a set containing only those that are part of the running game,
