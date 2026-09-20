@@ -4,7 +4,11 @@
 import os
 import re
 import shlex
+import shutil
+import signal
+import subprocess
 import threading
+import time
 from collections.abc import Iterable
 from gettext import gettext as _
 from typing import TYPE_CHECKING, Any
@@ -811,6 +815,54 @@ class wine(Runner):
             "help": _("The size of the virtual desktop in pixels."),
         },
         {
+            "option": "xephyr",
+            "section": _("Xephyr"),
+            "label": _("Nested display (Xephyr)"),
+            "type": "bool",
+            "advanced": True,
+            "default": False,
+            "condition": lambda: bool(shutil.which("Xephyr")),
+            "help": _(
+                "Run the game on a nested Xephyr display, e.g. for 16-bit color modes "
+                "modern X servers no longer support. Needs the Xephyr binary "
+                "(xorg-xephyr package). The server stops when the game closes."
+            ),
+        },
+        {
+            "option": "xephyr_resolution",
+            "section": _("Xephyr"),
+            "label": _("Xephyr resolution"),
+            "type": "choice_with_entry",
+            "conditional_on": "xephyr",
+            "advanced": True,
+            "choices": [
+                ("320x200", "320x200"),
+                ("320x240", "320x240"),
+                ("640x400", "640x400"),
+                ("640x480", "640x480"),
+                ("800x600", "800x600"),
+                ("1024x768", "1024x768"),
+                ("1280x1024", "1280x1024"),
+            ],
+            "default": "800x600",
+            "help": _("The size of the nested Xephyr display in pixels."),
+        },
+        {
+            "option": "xephyr_depth",
+            "section": _("Xephyr"),
+            "label": _("Xephyr color depth"),
+            "type": "choice",
+            "conditional_on": "xephyr",
+            "advanced": True,
+            "choices": [
+                (_("8-bit"), "8"),
+                (_("16-bit"), "16"),
+                (_("24-bit"), "24"),
+            ],
+            "default": "16",
+            "help": _("The color depth of the nested Xephyr display. 16-bit suits most old games."),
+        },
+        {
             "option": "Dpi",
             "section": _("DPI"),
             "label": _("Enable DPI Scaling"),
@@ -948,6 +1000,7 @@ class wine(Runner):
         self._working_dir = working_dir
         self._wine_arch = wine_arch
         self.dll_overrides = DEFAULT_DLL_OVERRIDES.copy()  # we'll modify this, so we better copy it
+        self.xephyr_pids: set = set()
 
     @property
     def context_menu_entries(self):
@@ -1964,8 +2017,170 @@ class wine(Runner):
             # so other games are unaffected once this game closes.
             command = self._wrap_virtual_desktop(command, launch_info["env"])
 
+        if self.runner_config.get("xephyr"):
+            xephyr_display = self._start_xephyr()
+            if xephyr_display:
+                launch_info["env"]["DISPLAY"] = xephyr_display
+
         launch_info["command"] = command
         return launch_info
+
+    @staticmethod
+    def _is_x11_session() -> bool:
+        """True when running on X11 (where client windows can be moved)."""
+        if os.environ.get("XDG_SESSION_TYPE") == "x11":
+            return True
+        return bool(os.environ.get("DISPLAY")) and not os.environ.get("WAYLAND_DISPLAY")
+
+    @staticmethod
+    def _list_root_windows(host_display: str) -> dict:
+        """Map root child window IDs to (width, height) via xwininfo."""
+        import subprocess as sp
+
+        try:
+            output = sp.run(
+                ["xwininfo", "-root", "-children", "-display", host_display],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            logger.debug("Could not list root windows: %s", ex)
+            return {}
+        windows = {}
+        for match in re.finditer(r"^\s+(0x[0-9a-fA-F]+)\b.*?(\d+)x(\d+)\+", output, re.MULTILINE):
+            try:
+                windows[int(match.group(1), 16)] = (int(match.group(2)), int(match.group(3)))
+            except ValueError:
+                continue
+        return windows
+
+    @classmethod
+    def _find_new_window(cls, before: dict, width: int, height: int, host_display: str) -> int | None:
+        """Find the Xephyr host window: new since 'before', matching WxH preferred."""
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            after = cls._list_root_windows(host_display)
+            new_ids = [window_id for window_id in after if window_id not in before]
+            for window_id in new_ids:
+                if after[window_id] == (width, height):
+                    return window_id
+            if len(new_ids) == 1:
+                return new_ids[0]
+            time.sleep(0.2)
+        return None
+
+    @classmethod
+    def _center_xephyr_window(cls, display: int, width: int, height: int, host_display: str, before: dict) -> None:
+        """Center the Xephyr host window on the primary monitor. Best effort."""
+        window_id = cls._find_new_window(before, width, height, host_display)
+        if window_id is None:
+            logger.debug("Could not find the Xephyr window to center.")
+            return
+        try:
+            from gi.repository import GdkX11
+        except (ImportError, ValueError) as ex:
+            logger.debug("Cannot center Xephyr window without Gdk: %s", ex)
+            return
+        try:
+            gdk_display = GdkX11.X11Display.open(host_display)
+            if gdk_display is None:
+                return
+            monitor = gdk_display.get_primary_monitor()
+            if monitor is None:
+                return
+            geometry = monitor.get_geometry()
+            x_pos = geometry.x + max(0, (geometry.width - width) // 2)
+            y_pos = geometry.y + max(0, (geometry.height - height) // 2)
+            window = GdkX11.X11Window.foreign_new_for_display(gdk_display, window_id)
+            if window is None:
+                return
+            window.move(x_pos, y_pos)
+            gdk_display.flush()
+            logger.info("Centered Xephyr display :%d at %d,%d.", display, x_pos, y_pos)
+        except Exception as ex:
+            logger.debug("Could not center Xephyr window: %s", ex)
+
+    @staticmethod
+    def _find_free_x_display(start: int = 10) -> int | None:
+        """Find a free X display number by probing the X11 socket dir."""
+        socket_dir = "/tmp/.X11-unix"
+        for display in range(start, start + 90):
+            if not os.path.exists(os.path.join(socket_dir, "X%d" % display)):
+                return display
+        return None
+
+    def _stop_tracked_xephyr(self) -> None:
+        """Kill previously tracked Xephyr servers that are still alive."""
+        for pid in list(self.xephyr_pids):
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                self.xephyr_pids.discard(pid)
+                continue
+            try:
+                logger.info("Stopping previous Xephyr server (PID %d).", pid)
+                os.kill(pid, signal.SIGTERM)
+            except OSError as ex:
+                logger.debug("Could not stop Xephyr PID %d: %s", pid, ex)
+            self.xephyr_pids.discard(pid)
+
+    def _start_xephyr(self) -> str | None:
+        """Start a nested Xephyr display for the game; return DISPLAY or None.
+
+        Any previously tracked server is stopped first, and the new PID is
+        tracked so Lutris cleans it up when the game stops."""
+        xephyr_bin = shutil.which("Xephyr")
+        if not xephyr_bin:
+            logger.warning("Xephyr is enabled but the Xephyr binary was not found.")
+            return None
+        self._stop_tracked_xephyr()
+        self.xephyr_pids = set()
+        resolution = str(self.runner_config.get("xephyr_resolution") or "800x600").strip()
+        if not re.match(r"^\d+x\d+$", resolution):
+            logger.warning("Invalid Xephyr resolution '%s', using 800x600.", resolution)
+            resolution = "800x600"
+        depth = str(self.runner_config.get("xephyr_depth") or "16").strip()
+        if depth not in ("8", "16", "24"):
+            logger.warning("Invalid Xephyr color depth '%s', using 16.", depth)
+            depth = "16"
+        display = self._find_free_x_display()
+        if display is None:
+            logger.warning("No free X display found for Xephyr.")
+            return None
+        host_display = os.environ.get("DISPLAY") or ":0"
+        want_center = self._is_x11_session() and bool(shutil.which("xwininfo"))
+        before_windows = self._list_root_windows(host_display) if want_center else {}
+        command = [xephyr_bin, ":%d" % display, "-screen", "%sx%s" % (resolution, depth), "-ac", "-br"]
+        logger.info("Starting Xephyr display :%d (%sx%s).", display, resolution, depth)
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as ex:
+            logger.warning("Failed to start Xephyr: %s", ex)
+            return None
+        socket_path = os.path.join("/tmp/.X11-unix", "X%d" % display)
+        for _attempt in range(100):
+            if os.path.exists(socket_path) and process.poll() is None:
+                break
+            if process.poll() is not None:
+                logger.warning("Xephyr exited prematurely.")
+                return None
+            time.sleep(0.1)
+        else:
+            logger.warning("Timed out waiting for the Xephyr display.")
+            process.kill()
+            return None
+        self.xephyr_pids.add(process.pid)
+        if want_center:
+            width, height = (int(part) for part in resolution.split("x"))
+            self._center_xephyr_window(display, width, height, host_display, before_windows)
+        return ":%d" % display
+
+    def _live_xephyr_pids(self, candidate_pids: Iterable[int]) -> set[int]:
+        """Tracked Xephyr PIDs still present, for game PID filtering."""
+        live = {pid for pid in self.xephyr_pids if pid in set(candidate_pids)}
+        self.xephyr_pids = live
+        return live
 
     def _wrap_virtual_desktop(self, command: list, env: dict) -> list:
         """Wrap the game command in a Wine virtual desktop window.
@@ -2008,9 +2223,11 @@ class wine(Runner):
 
             uuid_pids = set(pid for pid in candidate_pids if Process(pid).environ.get("LUTRIS_GAME_UUID") == game_uuid)
 
-            return (folder_pids & uuid_pids) | gamescope_pids
+            return (folder_pids & uuid_pids) | gamescope_pids | self._live_xephyr_pids(candidate_pids)
         else:
-            return super().filter_game_pids(candidate_pids, game_uuid, game_folder)
+            return super().filter_game_pids(candidate_pids, game_uuid, game_folder) | self._live_xephyr_pids(
+                candidate_pids
+            )
 
     def force_stop_game(self, game_pids: Iterable[int]) -> None:
         """Kill WINE with kindness, or at least with -k. This seems to leave a process
