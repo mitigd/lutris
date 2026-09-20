@@ -59,6 +59,16 @@ from lutris.util.wine.cnc_ddraw_conf import (
 from lutris.util.wine.d3d_extras import D3DExtrasManager
 from lutris.util.wine.d7vk import D7vkManager
 from lutris.util.wine.dgvoodoo2 import dgvoodoo2Manager
+from lutris.util.wine.dgvoodoo2_conf import (
+    build_runner_options as build_dgvoodoo2_conf_options,
+)
+from lutris.util.wine.dgvoodoo2_conf import (
+    get_managed_values as get_managed_dgvoodoo2_conf_values,
+)
+from lutris.util.wine.dgvoodoo2_conf import (
+    write_dgvoodoo_conf,
+)
+from lutris.util.wine.dll_manager import refreshing_version_choices
 from lutris.util.wine.dxgl import DxglManager
 from lutris.util.wine.dxvk import REQUIRED_VULKAN_API_VERSION, DXVKManager
 from lutris.util.wine.dxvk_conf import (
@@ -263,7 +273,7 @@ DDRAW_WRAPPER_LABELS = {
 
 # Runner toggles whose switch-off immediately cleans up deployed files
 # (the launch-time prelaunch path remains the backstop).
-DLL_CLEANUP_TRIGGERS = ("dxvk", "dxwrapper", "dxgl", "cnc_ddraw", "d7vk")
+DLL_CLEANUP_TRIGGERS = ("dxvk", "dxwrapper", "dxgl", "cnc_ddraw", "d7vk", "dgvoodoo2")
 
 
 def _get_ddraw_wrapper_warning(option_key: str, config: LutrisConfig) -> str | None:
@@ -539,8 +549,31 @@ class wine(Runner):
             "advanced": True,
             "type": "choice_with_entry",
             "conditional_on": "d7vk",
-            "choices": lambda: D7vkManager().version_choices,
+            "choices": refreshing_version_choices(D7vkManager),
             "default": lambda: D7vkManager().version,
+        },
+        {
+            "option": "dgvoodoo2",
+            "section": _("Graphics"),
+            "label": _("Enable dgvoodoo2"),
+            "type": "bool",
+            "default": False,
+            "warning": _get_ddraw_wrapper_warning,
+            "help": _(
+                "Use dgvoodoo2 to translate Glide and DirectX 1-9 calls for legacy games, "
+                "rendering through Direct3D 11/12 - combine with DXVK. Only 32-bit applications "
+                "are supported for DirectDraw and Glide."
+            ),
+        },
+        {
+            "option": "dgvoodoo2_version",
+            "section": _("Graphics"),
+            "label": _("dgvoodoo2 version"),
+            "advanced": True,
+            "type": "choice_with_entry",
+            "conditional_on": "dgvoodoo2",
+            "choices": refreshing_version_choices(dgvoodoo2Manager),
+            "default": lambda: dgvoodoo2Manager().version,
         },
         {
             "option": "sarek",
@@ -646,7 +679,7 @@ class wine(Runner):
             "advanced": True,
             "type": "choice_with_entry",
             "conditional_on": "dxwrapper",
-            "choices": lambda: DxWrapperManager().version_choices,
+            "choices": refreshing_version_choices(DxWrapperManager),
             "default": lambda: DxWrapperManager().version,
         },
         {
@@ -668,7 +701,7 @@ class wine(Runner):
             "advanced": True,
             "type": "choice_with_entry",
             "conditional_on": "dxgl",
-            "choices": lambda: DxglManager().version_choices,
+            "choices": refreshing_version_choices(DxglManager),
             "default": lambda: DxglManager().version,
         },
         {
@@ -690,7 +723,7 @@ class wine(Runner):
             "advanced": True,
             "type": "choice_with_entry",
             "conditional_on": "cnc_ddraw",
-            "choices": lambda: CncDdrawManager().version_choices,
+            "choices": refreshing_version_choices(CncDdrawManager),
             "default": lambda: CncDdrawManager().version,
         },
         {
@@ -901,6 +934,7 @@ class wine(Runner):
         *build_dxvk_conf_options(),
         *build_cnc_ddraw_conf_options(),
         *build_dxwrapper_conf_options(),
+        *build_dgvoodoo2_conf_options(),
     ]
 
     reg_prefix = "HKEY_CURRENT_USER/Software/Wine"
@@ -1498,6 +1532,9 @@ class wine(Runner):
         # DxWrapper reads dxwrapper.ini from the game directory; same deal.
         if game_dir and self.runner_config.get("dxwrapper"):
             write_dxwrapper_conf(game_dir, get_managed_dxwrapper_conf_values(self.runner_config))
+        # dgVoodoo2 reads dgVoodoo.conf from the game directory; same deal.
+        if game_dir and self.runner_config.get("dgvoodoo2"):
+            write_dgvoodoo_conf(game_dir, get_managed_dgvoodoo2_conf_values(self.runner_config))
 
         client_exe = self.game_config.get("client_exe")
         if client_exe:

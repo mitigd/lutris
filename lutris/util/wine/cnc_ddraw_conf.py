@@ -189,6 +189,10 @@ def get_managed_values(runner_config):
         value = runner_config[key]
         if value is None:
             continue
+        if isinstance(value, str) and not value.strip() and str(spec["default"]).strip():
+            # A cleared field means "back to default", never write empties
+            # over a non-empty default.
+            continue
         if _normalize(value) != _normalize(spec["default"]):
             values[key] = _normalize(value)
     return values
@@ -201,22 +205,20 @@ def _is_managed_section(header):
 def parse_conf(text):
     """Parse ddraw.ini text into entries preserving order, sections and comments.
 
-    Returns ("raw", line), ("section", name) or ("kv", section, key, value,
-    managed, line) tuples. Only keys inside the global [ddraw] section can
-    ever be managed; per-game sections are upstream's database.
+    Returns ("raw", line), ("section", name) or ("kv", section, key,
+    value, line) tuples. Only keys inside the global [ddraw] section can
+    ever be managed; per-game sections are upstream's database. Obsolete
+    management markers left by older Lutris versions are silently dropped.
     """
     entries = []
     section = ""
-    marked = False
     for line in text.splitlines():
         stripped = line.strip()
         if stripped == MANAGED_MARKER:
-            marked = True
             continue
         if stripped.startswith("[") and stripped.endswith("]"):
             section = stripped
             entries.append(("section", section))
-            marked = False
             continue
         if (
             not stripped
@@ -226,20 +228,19 @@ def parse_conf(text):
             or not _is_managed_section(section)
         ):
             entries.append(("raw", line))
-            marked = False
             continue
         key, _, value = stripped.partition("=")
-        entries.append(("kv", section, key.strip(), value.strip(), marked, line))
-        marked = False
+        entries.append(("kv", section, key.strip(), value.strip(), line))
     return entries
 
 
 def merge_conf(entries, values):
     """Merge managed values into parsed entries.
 
-    Lutris-managed lines under [ddraw] are updated or, when reset to
-    default, removed. Hand-written lines, comments and every other section
-    are preserved verbatim; new managed keys are appended to [ddraw].
+    Keys set in the GUI overwrite their line in place; everything else -
+    comments, unknown keys, other sections, values reset to default - is
+    preserved verbatim. New managed keys are appended to [ddraw]. Nothing
+    is ever deleted.
     """
     lines = []
     seen = set()
@@ -253,21 +254,12 @@ def merge_conf(entries, values):
             if _is_managed_section(entry[1]):
                 managed_section_seen = True
             continue
-        _kind, _section, key, _value, managed, line = entry
-        if key not in MANAGED_KEYS or not managed:
-            if key in values and key not in seen:
-                # GUI takes ownership of a hand-written line for this key.
-                lines.append(MANAGED_MARKER)
-                lines.append("%s=%s" % (key, values[key]))
-                seen.add(key)
-            else:
-                lines.append(line)
-            continue
-        seen.add(key)
-        if key in values:
-            lines.append(MANAGED_MARKER)
+        _kind, _section, key, _value, line = entry
+        if key in values and key not in seen:
             lines.append("%s=%s" % (key, values[key]))
-        # Managed keys reset to default are dropped.
+            seen.add(key)
+        else:
+            lines.append(line)
     if values:
         if not managed_section_seen:
             if lines and lines[-1].strip():
@@ -275,7 +267,6 @@ def merge_conf(entries, values):
             lines.append("[%s]" % MANAGED_SECTION)
         for key, value in values.items():
             if key not in seen:
-                lines.append(MANAGED_MARKER)
                 lines.append("%s=%s" % (key, value))
     text = "\n".join(lines)
     return text + "\n" if text.strip() else ""
@@ -284,8 +275,8 @@ def merge_conf(entries, values):
 def write_cnc_ddraw_conf(game_dir, values):
     """Write the managed values into the game dir's ddraw.ini.
 
-    Returns True when the file was created, updated or removed. Does
-    nothing when there is nothing to write and nothing to clean up.
+    Returns True when the file was created or updated. Does
+    nothing when there is nothing to write. Files are never deleted.
     """
     if not game_dir or not system.path_exists(game_dir):
         logger.warning("Game directory %s does not exist, skipping ddraw.ini.", game_dir)
@@ -300,8 +291,7 @@ def write_cnc_ddraw_conf(game_dir, values):
             logger.warning("Failed to read %s: %s", path, ex)
             return False
     entries = parse_conf(existing)
-    has_managed = any(entry[0] == "kv" and entry[4] for entry in entries)
-    if not values and not has_managed:
+    if not values:
         return False
     if existing and not system.path_exists(path + CONF_BACKUP_SUFFIX):
         try:
@@ -311,10 +301,6 @@ def write_cnc_ddraw_conf(game_dir, values):
         except OSError as ex:
             logger.warning("Failed to back up %s: %s", path, ex)
     merged = merge_conf(entries, values)
-    # Never delete config files: if nothing remains, leave a marker comment
-    # so stale managed lines are still cleared without removing the file.
-    if not merged:
-        merged = MANAGED_MARKER + "\n"
     try:
         with open(path, "w", encoding="utf-8") as conf_file:
             conf_file.write(merged)
@@ -357,7 +343,7 @@ def read_managed_values(game):
     for entry in entries:
         if entry[0] != "kv":
             continue
-        _kind, section, key, value, _managed, _line = entry
+        _kind, section, key, value, _line = entry
         if section.strip().casefold() != "[ddraw]":
             continue
         spec = by_key.get(key)

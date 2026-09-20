@@ -25,7 +25,7 @@ from lutris.services.lutris import download_lutris_media
 from lutris.util.jobs import AsyncCall
 from lutris.util.log import logger
 from lutris.util.strings import parse_playtime, slugify
-from lutris.util.wine import cnc_ddraw_conf, dxvk_conf, dxwrapper_conf
+from lutris.util.wine import cnc_ddraw_conf, dgvoodoo2_conf, dxvk_conf, dxwrapper_conf
 
 if TYPE_CHECKING:
     from lutris.gui.config.boxes import ConfigBox
@@ -471,6 +471,15 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
                 "managed_keys": dxwrapper_conf.MANAGED_KEYS,
                 "writer": dxwrapper_conf.write_managed_conf,
                 "reader": dxwrapper_conf.read_managed_values,
+            },
+            {
+                "flags": ("dgvoodoo2",),
+                "label": _("dgVoodoo2 Config"),
+                "tab_id": "dgvoodoo2",
+                "info": _("These options are written to the game's dgVoodoo.conf when dgvoodoo2 is enabled."),
+                "managed_keys": dgvoodoo2_conf.MANAGED_KEYS,
+                "writer": dgvoodoo2_conf.write_managed_conf,
+                "reader": dgvoodoo2_conf.read_managed_values,
             },
         ]
 

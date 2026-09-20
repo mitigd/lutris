@@ -169,6 +169,10 @@ DXWRAPPER_CONF_SPEC = [
 MANAGED_KEYS = frozenset((spec["section"], spec["key"]) for spec in DXWRAPPER_CONF_SPEC)
 
 
+def _option_name(section, key):
+    return "%s.%s" % (section, key)
+
+
 def _normalize(value):
     """Format a GUI value the way dxwrapper.ini expects it (1/0 flags)."""
     if value is True:
@@ -178,18 +182,38 @@ def _normalize(value):
     return str(value)
 
 
+def _backcompat_specs():
+    """Map bare pre-release option keys to their spec, when unambiguous."""
+    by_bare = {}
+    for spec in DXWRAPPER_CONF_SPEC:
+        by_bare.setdefault(spec["key"], []).append(spec)
+    return {key: specs[0] for key, specs in by_bare.items() if len(specs) == 1}
+
+
 def get_managed_values(runner_config):
-    """Return {(section, key): value} for options differing from default."""
+    """Return {(section, key): value} for options differing from default.
+
+    GUI options are named "Section.Key" while the file is addressed by
+    (section, key) pairs. Bare pre-release keys still work when the dotted
+    name is unset."""
+    backcompat = _backcompat_specs()
     values = {}
     for spec in DXWRAPPER_CONF_SPEC:
-        key = spec["key"]
-        if key not in runner_config:
+        option = _option_name(spec["section"], spec["key"])
+        if option in runner_config:
+            value = runner_config[option]
+        elif spec["key"] in runner_config and backcompat.get(spec["key"]) is spec:
+            value = runner_config[spec["key"]]
+        else:
             continue
-        value = runner_config[key]
         if value is None:
             continue
+        if isinstance(value, str) and not value.strip() and str(spec["default"]).strip():
+            # A cleared field means "back to default", never write empties
+            # over a non-empty default.
+            continue
         if _normalize(value) != _normalize(spec["default"]):
-            values[(spec["section"], key)] = _normalize(value)
+            values[(spec["section"], spec["key"])] = _normalize(value)
     return values
 
 
@@ -200,31 +224,26 @@ def _parse_section(header):
 def parse_conf(text):
     """Parse dxwrapper.ini text into entries preserving order and comments.
 
-    Returns ("raw", line), ("section", name) or ("kv", section, key, value,
-    managed, line) tuples.
+    Returns ("raw", line), ("section", name) or ("kv", section, key,
+    value, line) tuples. Obsolete management markers left by older Lutris
+    versions are silently dropped.
     """
     entries = []
     section = ""
-    marked = False
     for line in text.splitlines():
         stripped = line.strip()
         if stripped == MANAGED_MARKER:
-            marked = True
             continue
         if stripped.startswith("[") and stripped.endswith("]"):
             section = _parse_section(stripped)
             entries.append(("section", section))
-            marked = False
             continue
         if not stripped or stripped.startswith("#") or stripped.startswith(";") or "=" not in stripped:
             entries.append(("raw", line))
-            marked = False
             continue
         key, _, value = stripped.partition("=")
         key = key.strip()
-        managed = marked and (section, key) in MANAGED_KEYS
-        entries.append(("kv", section, key, value.strip(), managed, line))
-        marked = False
+        entries.append(("kv", section, key, value.strip(), line))
     return entries
 
 
@@ -247,7 +266,6 @@ def merge_conf(entries, values):
 
     def flush_pending(section):
         for key in list(pending.get(section, {})):
-            lines.append(MANAGED_MARKER)
             lines.append("%s = %s" % (key, pending[section].pop(key)))
 
     for entry in entries:
@@ -258,27 +276,12 @@ def merge_conf(entries, values):
             lines.append("[%s]" % entry[1])
             flush_pending(entry[1])
             continue
-        _kind, section, key, _value, managed, line = entry
-        if (section, key) not in MANAGED_KEYS or not managed:
-            if (section, key) in values and (section, key) not in seen:
-                # GUI takes ownership of a hand-written line for this key.
-                lines.append(MANAGED_MARKER)
-                lines.append("%s = %s" % (key, values[(section, key)]))
-                seen.add((section, key))
-            else:
-                lines.append(line)
-            continue
-        seen.add((section, key))
-        if (section, key) in values:
-            lines.append(MANAGED_MARKER)
+        _kind, section, key, _value, line = entry
+        if (section, key) in values and (section, key) not in seen:
             lines.append("%s = %s" % (key, values[(section, key)]))
-        # Managed keys reset to default are dropped.
-    for section in list(pending):
-        if pending[section]:
-            if lines and lines[-1].strip():
-                lines.append("")
-            lines.append("[%s]" % section)
-            flush_pending(section)
+            seen.add((section, key))
+        else:
+            lines.append(line)
     text = "\n".join(lines)
     return text + "\n" if text.strip() else ""
 
@@ -286,8 +289,8 @@ def merge_conf(entries, values):
 def write_dxwrapper_conf(game_dir, values):
     """Write the managed values into the game dir's dxwrapper.ini.
 
-    Returns True when the file was created, updated or removed. Does
-    nothing when there is nothing to write and nothing to clean up.
+    Returns True when the file was created or updated. Does
+    nothing when there is nothing to write. Files are never deleted.
     """
     if not game_dir or not system.path_exists(game_dir):
         logger.warning("Game directory %s does not exist, skipping dxwrapper.ini.", game_dir)
@@ -302,8 +305,7 @@ def write_dxwrapper_conf(game_dir, values):
             logger.warning("Failed to read %s: %s", path, ex)
             return False
     entries = parse_conf(existing)
-    has_managed = any(entry[0] == "kv" and entry[4] for entry in entries)
-    if not values and not has_managed:
+    if not values:
         return False
     if existing and not system.path_exists(path + CONF_BACKUP_SUFFIX):
         try:
@@ -313,10 +315,6 @@ def write_dxwrapper_conf(game_dir, values):
         except OSError as ex:
             logger.warning("Failed to back up %s: %s", path, ex)
     merged = merge_conf(entries, values)
-    # Never delete config files: if nothing remains, leave a marker comment
-    # so stale managed lines are still cleared without removing the file.
-    if not merged:
-        merged = MANAGED_MARKER + "\n"
     try:
         with open(path, "w", encoding="utf-8") as conf_file:
             conf_file.write(merged)
@@ -361,7 +359,7 @@ def read_managed_values(game):
     for entry in entries:
         if entry[0] != "kv":
             continue
-        _kind, _section, key, value, _managed, _line = entry
+        _kind, _section, key, value, _line = entry
         spec = by_key.get(key)
         if spec is None:
             continue
@@ -410,16 +408,16 @@ def build_runner_options():
 
     options = []
     for spec in DXWRAPPER_CONF_SPEC:
-        key = spec["key"]
+        option = _option_name(spec["section"], spec["key"])
         kind = spec["type"]
         default = spec["default"]
         if kind == "flag":
             options.append(
                 {
-                    "option": key,
+                    "option": option,
                     "section": _("DxWrapper Config"),
                     "config_tab": "dxwrapper",
-                    "label": key,
+                    "label": option,
                     "type": "bool",
                     "default": default,
                     "help": _(spec["help"]),
@@ -428,10 +426,10 @@ def build_runner_options():
         else:
             options.append(
                 {
-                    "option": key,
+                    "option": option,
                     "section": _("DxWrapper Config"),
                     "config_tab": "dxwrapper",
-                    "label": key,
+                    "label": option,
                     "type": "string",
                     "default": str(default),
                     "help": _(spec["help"]),

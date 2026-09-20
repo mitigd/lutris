@@ -696,6 +696,10 @@ def get_managed_values(runner_config):
         value = runner_config[key]
         if value is None:
             continue
+        if isinstance(value, str) and not value.strip() and str(spec["default"]).strip():
+            # A cleared field means "back to default", never write empties
+            # over a non-empty default.
+            continue
         if _normalize(value) != _normalize(spec["default"]):
             values[key] = _normalize(value)
     return values
@@ -705,32 +709,28 @@ def parse_conf(text):
     """Parse dxvk.conf text into entries preserving order and comments.
 
     Returns a list of ("raw", line) for comments/blanks/unknown lines and
-    ("kv", key, value, managed, line) for assignments, where managed is
-    True when the line carries Lutris' management marker.
+    ("kv", key, value, line) for assignments. Obsolete management markers
+    left by older Lutris versions are silently dropped.
     """
     entries = []
-    marked = False
     for line in text.splitlines():
         stripped = line.strip()
         if stripped == MANAGED_MARKER:
-            marked = True
             continue
         if not stripped or stripped.startswith("#") or stripped.startswith(";") or "=" not in stripped:
             entries.append(("raw", line))
-            marked = False
             continue
         key, _, value = stripped.partition("=")
-        entries.append(("kv", key.strip(), value.strip(), marked, line))
-        marked = False
+        entries.append(("kv", key.strip(), value.strip(), line))
     return entries
 
 
 def merge_conf(entries, values):
     """Merge managed values into parsed entries.
 
-    Lutris-managed lines are updated or, when reset to default, removed.
-    Hand-written lines (even for managed keys) and unknown keys are
-    preserved verbatim; new managed keys are appended with a marker.
+    Keys set in the GUI overwrite their line in place; everything else -
+    comments, unknown keys, values reset to default - is preserved
+    verbatim. New managed keys are appended. Nothing is ever deleted.
     """
     lines = []
     seen = set()
@@ -738,24 +738,14 @@ def merge_conf(entries, values):
         if entry[0] == "raw":
             lines.append(entry[1])
             continue
-        _kind, key, _value, managed, line = entry
-        if key not in MANAGED_KEYS or not managed:
-            if key in values and key not in seen:
-                # GUI takes ownership of a hand-written line for this key.
-                lines.append(MANAGED_MARKER)
-                lines.append("%s = %s" % (key, values[key]))
-                seen.add(key)
-            else:
-                lines.append(line)
-            continue
-        seen.add(key)
-        if key in values:
-            lines.append(MANAGED_MARKER)
+        _kind, key, _value, line = entry
+        if key in values and key not in seen:
             lines.append("%s = %s" % (key, values[key]))
-        # Managed keys reset to default are dropped.
+            seen.add(key)
+        else:
+            lines.append(line)
     for key, value in values.items():
         if key not in seen:
-            lines.append(MANAGED_MARKER)
             lines.append("%s = %s" % (key, value))
     text = "\n".join(lines)
     return text + "\n" if text.strip() else ""
@@ -764,8 +754,8 @@ def merge_conf(entries, values):
 def write_dxvk_conf(game_dir, values):
     """Write the managed values into the game dir's dxvk.conf.
 
-    Returns True when the file was created, updated or removed. Does
-    nothing when there is nothing to write and nothing to clean up.
+    Returns True when the file was created or updated. Does
+    nothing when there is nothing to write. Files are never deleted.
     """
     if not game_dir or not system.path_exists(game_dir):
         logger.warning("Game directory %s does not exist, skipping dxvk.conf.", game_dir)
@@ -780,8 +770,7 @@ def write_dxvk_conf(game_dir, values):
             logger.warning("Failed to read %s: %s", path, ex)
             return False
     entries = parse_conf(existing)
-    has_managed = any(entry[0] == "kv" and entry[1] in MANAGED_KEYS for entry in entries)
-    if not values and not has_managed:
+    if not values:
         return False
     if existing and not system.path_exists(path + CONF_BACKUP_SUFFIX):
         try:
@@ -791,10 +780,6 @@ def write_dxvk_conf(game_dir, values):
         except OSError as ex:
             logger.warning("Failed to back up %s: %s", path, ex)
     merged = merge_conf(entries, values)
-    # Never delete config files: if nothing remains, leave a marker comment
-    # so stale managed lines are still cleared without removing the file.
-    if not merged:
-        merged = MANAGED_MARKER + "\n"
     try:
         with open(path, "w", encoding="utf-8") as conf_file:
             conf_file.write(merged)
@@ -858,7 +843,7 @@ def read_managed_values(game):
     for entry in entries:
         if entry[0] != "kv":
             continue
-        _kind, key, value, _managed, _line = entry
+        _kind, key, value, _line = entry
         spec = by_key.get(key)
         if spec is None:
             continue

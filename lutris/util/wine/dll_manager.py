@@ -4,6 +4,7 @@ import filecmp
 import json
 import os
 import shutil
+import time
 from gettext import gettext as _
 
 from lutris import settings
@@ -27,6 +28,9 @@ class DLLManager:
     releases_url = NotImplemented
     archs = {32: "x32", 64: "x64"}
     proton_compatible = False  # Proton manages its own DLLs
+    # Refresh release info at most this often; older versions files are
+    # refetched in the background so newly published versions show up.
+    versions_refresh_interval = 24 * 3600
     known_versions: dict[str, str] = {}
     # Pinned versions mapped to direct download URLs. These are always
     # listed (and downloadable) without needing the versions file that is
@@ -448,6 +452,29 @@ class DLLManager:
             os.mkdir(self.base_dir)
         download_file(self.releases_url, self.versions_path, overwrite=True)
 
+    def versions_need_refresh(self):
+        """True when release info is missing or older than the refresh interval."""
+        try:
+            age = time.time() - os.path.getmtime(self.versions_path)
+        except OSError:
+            return True
+        return age > self.versions_refresh_interval
+
+    def refresh_versions_async(self, on_done=None):
+        """Refetch release info in a worker thread; on_done runs afterwards.
+
+        When called from the UI thread via AsyncCall below, on_done fires on
+        the main loop. Any failure is logged and swallowed."""
+        from lutris.util.jobs import AsyncCall
+
+        def _done(_result, error):
+            if error:
+                logger.debug("Version refresh for %s failed: %s", self.human_name, error)
+            elif on_done:
+                on_done()
+
+        AsyncCall(self.fetch_versions, _done)
+
     def upgrade(self):
         if not self.is_available():
             versions = self.load_versions()
@@ -470,3 +497,34 @@ class DLLManager:
                 )
 
             # We found nothing compatible, and downloaded everything, we just give up.
+
+
+def refreshing_version_choices(manager_class):
+    """Build a version choices callable that refreshes stale release info.
+
+    Returns the current choices (pinned/local/file versions) immediately
+    and refetches them in the background when older than the refresh
+    interval, so newly published upstream versions show up without any
+    manual steps. Implements the register_reload_callback protocol the
+    config dialog uses to repopulate the dropdown in place.
+    """
+    reload_callbacks = []
+
+    def get_choices():
+        manager = manager_class()
+        if manager.versions_need_refresh():
+            pending = list(reload_callbacks)
+            reload_callbacks.clear()
+
+            def _fire():
+                for callback in pending:
+                    callback()
+
+            manager.refresh_versions_async(_fire)
+        return manager.version_choices
+
+    def register_reload_callback(callback):
+        reload_callbacks.append(callback)
+
+    get_choices.register_reload_callback = register_reload_callback
+    return get_choices
