@@ -73,7 +73,12 @@ def get_winelib_paths(wine_path: str) -> list[str]:
     """Return wine libraries path for a Lutris wine build"""
     paths = []
     # Prioritize libwine.so.1 for lutris builds
-    for winelib_path in ("lib", "lib64"):
+    for winelib_path in (
+        "lib",
+        "lib64",
+        "lib/i386-linux-gnu",
+        "lib/x86_64-linux-gnu",
+    ):
         winelib_fullpath = os.path.join(wine_path or "", winelib_path)
         if system.path_exists(winelib_fullpath):
             paths.append(winelib_fullpath)
